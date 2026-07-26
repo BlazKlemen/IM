@@ -5,7 +5,7 @@ Function main
     String line$
     String command$(7) ' Polje za razclenjevanje prejetih podatkov
     Integer i
-    Integer abortFlag  ' Zastavica za varen izhod ob napaki kamere
+    Integer abortFlag  ' Zastavica za varen izhod ob premiku izdelka
     
     ' Zacetne nastavitve robota
     Motor On
@@ -19,7 +19,7 @@ Function main
     
    
     Do
-        Print "--- Cakam na povezavo s Pythonom na portu 5000... ---"
+        Print "--- Cakam na povezavo s Pythonom na portu 12345... ---"
         CloseNet #201
         Wait 0.5
       
@@ -69,11 +69,11 @@ Function main
                     ' ODREMO POT OD P0 DO P4
                     For i = 0 To 4
                         Print "Premik na tocko P", i
-                        Move P(i) /1
+                        Move P(i) /1 
                         
                         ' Vmes med premiki neprestano preverjamo, ce je Python poslal kodo za abort (2)
                         If ChkNet(201) > 0 Then
-                            ' KLJUCNI POPRAVEK 1: Dejansko preberemo nov podatek iz omrežja!
+                            ' KLJUCNI POPRAVEK 1: Dejansko preberemo nov podatek iz omrezja!
                             Input #201, line$
                             
                             ParseStr line$, command$(), " "
@@ -94,7 +94,7 @@ Function main
                     
                    
                     Write #201, "1"
-                    Print "[Robot] Nanos uspešno zakljucen!"
+                    Print "[Robot] Nanos uspesno zakljucen!"
                 EndIf
                 
             EndIf

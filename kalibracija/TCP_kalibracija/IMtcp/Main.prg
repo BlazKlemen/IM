@@ -22,7 +22,7 @@ Function main
     Go P0 +Z(30)
     
     Do
-        Print "--- Cakam na povezavo s Pythonom na portu 5000... ---"
+        Print "--- Cakam na povezavo s Pythonom na portu 12345... ---"
         CloseNet #201
         Wait 0.5
       
@@ -55,7 +55,7 @@ Function main
                         ' Program se ustavi in caka na pritisk tipke Enter
                         Input line$ 
                         
-                        ' KLJUCNO: Preklopimo na Tool 0, saj želimo izmeriti tocno pozicijo flanše!
+                        ' Preklopimo na Tool 0, saj zelimo izmeriti tocno pozicijo flange!
                         Tool 0
                         cx = CX(CurPos)
                         cy = CY(CurPos)
@@ -67,7 +67,7 @@ Function main
                         ' Sestavimo niz v formatu "x,y,z,u,v,w"
                         msg$ = Str$(cx) + "," + Str$(cy) + "," + Str$(cz) + "," + Str$(cu) + "," + Str$(cv) + "," + Str$(cw)
                         
-                        ' Pošljemo tocko Pythonu preko socketa
+                        ' Posljemo tocko Pythonu preko socketa
                         Write #201, msg$
                         Print "[Robot] Tocka ", i, " poslana Pythonu: ", msg$
                     Next

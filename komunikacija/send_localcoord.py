@@ -15,7 +15,7 @@ TCP_PORT = 12345       # V Epson Port 201 nastavi enak port
 # Skupna deljena spremenljivka za preverjanje premika
 movementError = False
 error_lock = threading.Lock()
-stop_event = threading.Event()  # POPRAVLJENO: Počiščena tiskarska napaka
+stop_event = threading.Event()  
 
 ROI_SIZE = 100 
 MOVEMENT_THRESHOLD = 0.9 
@@ -35,92 +35,56 @@ def matrix_to_epson(T):
     u, v, w = rot.as_euler('zyx', degrees=True)
     return x, y, z, u, v, w
 
-def moveRobot(transform_matrix, product_type):
+def moveRobot(conn, transform_matrix, product_type):
     """
-    Izračuna 3D odmike iz kalibracijske matrike in jih pošlje Epsonu,
-    da si nastavi Local 1. Nato čaka na potrditev o koncu celotne poti.
+    Izračuna 3D odmike iz kalibracijske matrike in jih pošlje Epsonu preko GLOBALNEGA socketa.
+    Vrne True, če je cikel uspešno zaključen, oziroma False ob napaki/prekinitvi.
     """
     global movementError
     
-    # 1. IZ RAČUNA ODMIKOV (Iz 4x4 matrike dobimo dx, dy, dz, rx, ry, rz)
-    # Ker transform_matrix že predstavlja premik, jo neposredno pretvorimo
     dx, dy, dz, rx, ry, rz = matrix_to_epson(transform_matrix)
+    print(f"[Robot] Pošiljam Local 1 odmike na robot: X={dx:.2f}, Y={dy:.2f}, Z={dz:.2f}...")
     
-    print(f"[Robot] Izračunani odmiki za Local 1:")
-    print(f"        T: [{dx:.2f}, {dy:.2f}, {dz:.2f}]")
-    print(f"        R: [{rx:.2f}, {ry:.2f}, {rz:.2f}]")
-    print(f"[Robot] Odpiram Socket Server na portu {TCP_PORT}...")
-
-    # --- 2. VZPOSTAVITEV TCP STREŽNIKA ---
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    ukaz = f"1 {product_type} {dx:.3f} {dy:.3f} {dz:.3f} {rx:.3f} {ry:.3f} {rz:.3f}\n"
     
     try:
-        server_socket.bind((TCP_IP, TCP_PORT))
-        server_socket.listen(1)
-        print("[Robot] Čakam na povezavo Epson robota...")
-        
-        server_socket.settimeout(1.0)
-        conn = None
-        while not stop_event.is_set():
-            try:
-                conn, addr = server_socket.accept()
-                print(f"[Robot] Robot se je povezal iz: {addr}")
-                break
-            except socket.timeout:
-                continue
-                
-        if stop_event.is_set() or conn is None:
-            server_socket.close()
-            return
-
-        # --- 3. POŠILJANJE KOORDINATNEGA SISTEMA ---
-        # Pošljemo samo EN paket z nastavitvami za Local 1
-        # Format: "1 product_type dx dy dz rx ry rz\n"
-        ukaz = f"1 {product_type} {dx:.3f} {dy:.3f} {dz:.3f} {rx:.3f} {ry:.3f} {rz:.3f}\n"
         conn.sendall(ukaz.encode('utf-8'))
-        print("[Robot] Podatki za Local 1 poslani. Robot začenja s potjo P0-P4.")
-
-        # --- 4. ČAKANJE NA POTRDITEV CELOTNE POTI ---
-        # Robot zdaj vozi samostojno, mi le poslušamo in po potrebi javimo napako kamere
         pot_zakljucena = False
-        conn.settimeout(0.05)  # 50 ms timeout, da ne blokiramo niti za kamero
+        conn.settimeout(0.05)  # Kratek timeout za neblokirajoče spremljanje kamere
 
         while not stop_event.is_set() and not pot_zakljucena:
-            
-            # Preverjanje kamere: Če se izdelek premakne, robotu takoj pošljemo kodo 2 (Abort)
+            # Preverjanje kamere
             with error_lock:
                 if movementError:
                     print("[Robot] Zaznan premik izdelka! Pošiljam ABORT signal robotu.")
                     conn.sendall("2\n".encode('utf-8'))
-                    return
+                    return False
 
             try:
-                # Čakamo na končni odgovor "1" s strani robota
                 odgovor = conn.recv(1024).decode('utf-8').strip()
                 if not odgovor:
-                    print("[Robot] Robot je predčasno zaprl povezavo.")
-                    return
+                    print("[Robot] Povezava je bila prekinjena s strani robota.")
+                    return False
                 
                 if odgovor == "1":
-                    print("[Robot] Robot javlja: Celotna pot P0-Pi je uspešno prevožena!")
+                    print("[Robot] Uspešno izveden celoten cikel nanosa!")
                     pot_zakljucena = True
-                    
+                    return True
             except socket.timeout:
-                # Timeout je med vožnjo normalen, zanka se samo zavrti in spet preveri kamero
                 pass
             except Exception as e:
-                print(f"[Robot] Napaka pri komunikaciji: {e}")
-                return
-
+                print(f"[Robot] Napaka pri poslušanju robota: {e}")
+                return False
+                
     except Exception as e:
-        print(f"[Robot] Splošna napaka v socket strežniku: {e}")
-        
+        print(f"[Robot] Napaka pri pošiljanju ukaza: {e}")
+        return False
     finally:
-        if conn:
-            conn.close()
-        server_socket.close()
-        print("[Robot] Povezava zaprta.")
+        # VEDNO ponastavimo timeout nazaj na blokirajoče čakanje za naslednje ukaze!
+        try:
+            conn.settimeout(None)
+        except Exception:
+            pass
 
 def checkMovement():
     return # trenutno ne uporabimo čekiranja premika 
@@ -176,20 +140,39 @@ def checkMovement():
 def main():
     global movementError
     
-    # Testna kalibracijska matrika (v realnosti bo to izračunana matrika)
+    # Testna kalibracijska matrika
     TRAN_MATRIX = np.array([
         [1.0, 0, 0.0, 50.0],
         [0.0, 1.0, 0.0, 50.0],
-        [0.0, 0.0, 1.0, 50],
+        [0.0, 0.0, 1.0, 50.0],
         [0.0, 0.0, 0.0, 1.0]
     ])
     
-    print("Sistem pripravljen. Postavi izdelek v POI in pritisni ENTER...")
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.bind((TCP_IP, TCP_PORT))
+    server_socket.listen(1)
+    
+    print(f"\n[Sistem] Strežnik posluša na portu {TCP_PORT}...")
+    print("[Sistem] ZAŽENI program na Epson robotu zdaj.")
+    
+    global_conn = None
+    try:
+        global_conn, addr = server_socket.accept()
+        print(f"[Sistem] Povezava VZPOSTAVLJENA z naslova: {addr}\n")
+    except Exception as e:
+        print(f"[Sistem] Napaka pri vzpostavljanju povezave: {e}")
+        server_socket.close()
+        return
+
+    print("Sistem pripravljen. Po zagonu Epsona postavi izdelek v POI in pritisni ENTER.")
+    
     try: 
         while not stop_event.is_set():
             if keyboard.is_pressed('enter'):
                 print("\n[Main] Enter pritisnjen. Začenjam cikel...")
                 
+                # Počakamo, da uporabnik sprosti tipko Enter (da ne sproži več ciklov hkrati)
                 while keyboard.is_pressed('enter'):
                     time.sleep(0.05)
                 
@@ -198,10 +181,10 @@ def main():
                 with error_lock:
                     movementError = False
                     
-                time.sleep(0.5) 
+                time.sleep(0.2) 
                 
-                # Zaženemo niti: Robotu pošljemo našo TRAN_MATRIX
-                mainThread = threading.Thread(target=moveRobot, args=(TRAN_MATRIX, product_type))
+                # Zaženemo niti
+                mainThread = threading.Thread(target=moveRobot, args=(global_conn, TRAN_MATRIX, product_type))
                 movementThread = threading.Thread(target=checkMovement)
                 
                 movementThread.start()
@@ -213,15 +196,23 @@ def main():
                 print("\n[Main] Cikel zaključen. Pripravljen na nov izdelek (Pritisni ENTER)...")
                 time.sleep(0.5)
             
-            
-            elif keyboard.is_pressed('delete'):
-                
             time.sleep(0.05)
+            
     except KeyboardInterrupt:
         print("\n\n[Main] Zaznan Ctrl + C! Sprožam varen izhod iz vseh niti...")
         stop_event.set()
-        time.sleep(1)
-        print("[Main] Vse niti ustavljene. Program se zapira.")
+    finally:
+        # Varno zapremo vse vtičnice ob izhodu iz programa
+        if global_conn:
+            try:
+                global_conn.close()
+            except Exception:
+                pass
+        try:
+            server_socket.close()
+        except Exception:
+            pass
+        print("[Main] Strežnik varno zaprt. Program zaključen.")
         sys.exit(0)
 
 if __name__ == "__main__":

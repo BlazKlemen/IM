@@ -110,6 +110,13 @@ def moveRobot(conn, transform_matrix, product_type):
                 return
     except Exception as e:
         print(f"[Robot] Napaka pri pošiljanju ukaza: {e}")
+    finally:
+        # KLJUČNO: VEDNO ponastavimo timeout nazaj na blokirajoče čakanje (None),
+        # da bodo naslednje operacije (npr. TCP kalibracija) delovale brez nevarnosti 50ms timeouta!
+        try:
+            conn.settimeout(None)
+        except Exception:
+            pass
 
 def checkMovement():
     return # trenutno ne uporabimo čekiranja premika 
@@ -210,7 +217,7 @@ def main():
                     
                 time.sleep(0.2) 
                 
-                # Niti poženemo in ji predamo že obstoječo globalno povezavo 'global_conn'
+                # Niti poženemo in ji predamo že obstoječo globalno povezavo 
                 mainThread = threading.Thread(target=moveRobot, args=(global_conn, TRAN_MATRIX, product_type))
                 movementThread = threading.Thread(target=checkMovement)
                 
@@ -274,8 +281,15 @@ def main():
         print("\n\n[Main] Zaznan Ctrl + C! Zapiram globalni socket...")
         stop_event.set()
     finally:
-        global_conn.close()
-        server_socket.close()
+        if global_conn:
+            try:
+                global_conn.close()
+            except Exception:
+                pass
+        try:
+            server_socket.close()
+        except Exception:
+            pass
         print("[Main] Strežnik varno zaprt. Program zaključen.")
         sys.exit(0)
 

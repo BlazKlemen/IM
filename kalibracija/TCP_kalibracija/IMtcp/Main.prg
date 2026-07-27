@@ -1,3 +1,9 @@
+' ======================================================================
+' GLOBALNE SPREMENLJIVKE (za komunikacijo med nitmi)
+' ======================================================================
+Global Boolean g_AbortFlag               ' Zastavica za sporočanje napake iz MovementMonitor-ja
+Global Boolean g_MovementMonitorRunning  ' Zastavica za izklop vzporedne niti
+
 Function main
     ' Deklaracija spremenljivk (usklajena s Pythonom)
     Real dx, dy, dz, rx, ry, rz
@@ -5,9 +11,8 @@ Function main
     String line$
     String command$(7) ' Polje za razclenjevanje prejetih podatkov
     Integer i
-    Integer abortFlag  ' Zastavica za varen izhod ob napaki kamere
     
-    ' DODANO: Spremenljivke za TCP kalibracijo (Koda 3)
+    ' Spremenljivke za TCP kalibracijo (Koda 3)
     Real cx, cy, cz, cu, cv, cw
     String msg$
     
@@ -35,13 +40,12 @@ Function main
             If ChkNet(201) > 0 Then
                 
                 Input #201, line$
-               
                 ParseStr line$, command$(), " "
                 type = Val(command$(0)) ' Prvi parameter je vedno KODA UKAZA
                 
                 ' --- KODA 2: Napaka / Premik izdelka (Abort) pred zacetkom ---
                 If type = 2 Then
-                    Print "[Robot] Kamera javlja PREMIK IZDELKA! Takoj prekinjam serijo!"
+                    Print "[Robot] Kamera javlja PREMIK IZDELKA pred začetkom!"
                     Exit Do ' Izstopimo iz notranje zanke
                 EndIf
                 
@@ -92,38 +96,45 @@ Function main
                     
                     ' Dvignemo se nad zacetno tocko P0 glede na Local 1
                     Move P0 +Z(50) /1
-                    Wait 1 ' Stabilizacija
+                    Wait 0.5 ' Stabilizacija
                     
-                    ' Ponastavimo zastavico pred zacetkom poti
-                    abortFlag = 0
+                    ' --------------------------------------------------
+                    ' 1. ZAGON VZPOREDNE NITI MovementMonitor
+                    ' --------------------------------------------------
+                    g_AbortFlag = False
+                    g_MovementMonitorRunning = True
+                    Xqt MovementMonitor, NoPause ' Poženemo nadzor premika v ozadju!
+                    
+                    Print "[Robot] Začenjam nanos P0 -> P4 s stalnim nadzorom kamere..."
                     
                     ' ODREMO POT OD P0 DO P4
                     For i = 0 To 4
+                        If g_AbortFlag Then
+                            Exit For ' Če je MovementMonitor ustavil robota z AbortMotion, izstopimo
+                        EndIf
+                        
                         Print "Premik na tocko P", i
                         Move P(i) /1
-                        
-                        ' Vmes med premiki neprestano preverjamo, ce je Python poslal kodo za abort (2)
-                        If ChkNet(201) > 0 Then
-                            Input #201, line$
-                            
-                            ParseStr line$, command$(), " "
-                            type = Val(command$(0))
-                            
-                            If type = 2 Then
-                                Print "[Robot] Kamera javlja PREMIK IZDELKA! Prekinjam delo na P", i
-                                abortFlag = 1 ' Nastavimo zastavico za abort
-                                Exit For ' Izstopimo iz For zanke
-                            EndIf
-                        EndIf
                     Next
                     
-                    ' Ce smo morali prekiniti delo, takoj zapustimo notranjo zanko
-                    If abortFlag = 1 Then
-                        Exit Do
-                    EndIf
+                    ' --------------------------------------------------
+                    ' 2. ZAKLJUČEK VZPOREDNE NITI
+                    ' --------------------------------------------------
+                    g_MovementMonitorRunning = False
+                    Wait 0.05
+                    Quit MovementMonitor ' Varno ugasnemo nit
                     
-                    Write #201, "1"
-                    Print "[Robot] Nanos uspe?no zakljucen!"
+                    ' --------------------------------------------------
+                    ' 3. PREVERJANJE REZULTATA NANOSA
+                    ' --------------------------------------------------
+                    If g_AbortFlag Then
+                        Print "[Robot] CIKEL PREKINJEN zaradi premika kosa! Umikam robota..."
+                        Move P0 +Z(50) ' Varen umik navzgor
+                        Exit Do        ' Prekinemo notranjo zanko
+                    Else
+                        Write #201, "1"
+                        Print "[Robot] Nanos uspešno zaključen!"
+                    EndIf
                 EndIf
                 
             EndIf
@@ -137,4 +148,34 @@ Function main
         
     Loop
 
+Fend
+
+' ======================================================================
+' VZPOREDNA NIT: Spremlja omrežni port za premik kosa med delom
+' ======================================================================
+Function MovementMonitor
+    String line$
+    String command$(7)
+    Int32 type
+    
+    Do While g_MovementMonitorRunning
+        ' Preverimo, če je Python poslal nov podatek preko socketa
+        If ChkNet(201) > 0 Then
+            Input #201, line$
+            ParseStr line$, command$(), " "
+            type = Val(command$(0))
+            
+            ' Če prejmemo kodo 2 (Premik kosa), TAKOJ ustavimo robota!
+            If type = 2 Then
+                Print "[MovementMonitor] ZAZNAN PREMIK IZDELKA (type=2)! Ustavljam robota!"
+                g_AbortFlag = True
+                
+                ' Ukaz AbortMotion v trenutku prekine fizično gibanje robota
+                AbortMotion
+                Exit Do
+            EndIf
+        EndIf
+        
+        Wait 0.01 ' Hitro osveževanje (vsakih 10 ms)
+    Loop
 Fend

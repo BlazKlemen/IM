@@ -1,11 +1,16 @@
+' ======================================================================
+' GLOBALNE SPREMENLJIVKE (za komunikacijo med nitmi)
+' ======================================================================
+Global Boolean g_AbortFlag               ' Zastavica, ki sporoči main-u, da je kamera javila napako
+Global Boolean g_MovementMonitorRunning  ' Zastavica za varen izklop vzporedne niti
+
 Function main
-    ' Deklaracija spremenljivk (usklajena s Pythonom)
+    ' Deklaracija lokalnih spremenljivk
     Real dx, dy, dz, rx, ry, rz
     Int32 type
     String line$
-    String command$(7) ' Polje za razclenjevanje prejetih podatkov
+    String command$(7)
     Integer i
-    Integer abortFlag  ' Zastavica za varen izhod ob premiku izdelka
     
     ' Zacetne nastavitve robota
     Motor On
@@ -17,34 +22,31 @@ Function main
     
     Go P0 +Z(30)
     
-   
     Do
         Print "--- Cakam na povezavo s Pythonom na portu 12345... ---"
         CloseNet #201
         Wait 0.5
       
         OpenNet #201 As Client
+        Wait 0.5
         WaitNet #201
         
         Print "--- Povezava vzpostavljena! Zacenjam sekvenco... ---"
         
         Do
-            
             If ChkNet(201) > 0 Then
                 
                 Input #201, line$
-               
                 ParseStr line$, command$(), " "
                 type = Val(command$(0)) ' Prvi parameter je vedno KODA UKAZA
                 
-                ' --- KODA 2: Napaka / Premik izdelka (Abort) pred zacetkom ---
+                ' --- KODA 2: Napaka pred zacetkom ---
                 If type = 2 Then
-                    Print "[Robot] Kamera javlja PREMIK IZDELKA! Takoj prekinjam serijo!"
-                    Exit Do ' Izstopimo iz notranje zanke
+                    Print "[Robot] Kamera javlja PREMIK IZDELKA pred začetkom!"
+                    Exit Do
                 EndIf
                 
-               
-                 ' --- KODA 1: Prejet nov koordinatni sistem za zacetek cikla ---
+                ' --- KODA 1: Prejet nov koordinatni sistem za zacetek cikla ---
                 If type = 1 Then
                     
                     dx = Val(command$(2))
@@ -55,53 +57,57 @@ Function main
                     rz = Val(command$(7))
                     
                     Print "Prejel koordinatni sistem. Nastavljam Local 1..."
-                    
-                    ' Nastavimo nagnjeno mizo / kos
                     Local 1, XY(dx, dy, dz, rx, ry, rz)
                     
                     ' Dvignemo se nad zacetno tocko P0 glede na Local 1
                     Move P0 +Z(50) /1
-                    Wait 1 ' Stabilizacija
+                    Wait 0.5 ' Stabilizacija
                     
-                    ' Ponastavimo zastavico pred zacetkom poti
-                    abortFlag = 0
+                    ' --------------------------------------------------
+                    ' 1. ZAGON VZPOREDNE NITI MovementMonitor
+                    ' --------------------------------------------------
+                    g_AbortFlag = False
+                    g_MovementMonitorRunning = True
+                    Xqt MovementMonitor, NoPause ' Poženemo nadzor premika v ozadju!
+                    
+                    Print "[Robot] Začenjam nanos P0 -> P4 s stalnim nadzorom kamere..."
                     
                     ' ODREMO POT OD P0 DO P4
+                    AutoLJM On
                     For i = 0 To 4
-                        Print "Premik na tocko P", i
-                        Move P(i) /1 
-                        
-                        ' Vmes med premiki neprestano preverjamo, ce je Python poslal kodo za abort (2)
-                        If ChkNet(201) > 0 Then
-                            ' KLJUCNI POPRAVEK 1: Dejansko preberemo nov podatek iz omrezja!
-                            Input #201, line$
-                            
-                            ParseStr line$, command$(), " "
-                            type = Val(command$(0))
-                            
-                            If type = 2 Then
-                                Print "[Robot] Kamera javlja PREMIK IZDELKA! Prekinjam delo na P", i
-                                abortFlag = 1 ' Nastavimo zastavico za abort
-                                Exit For ' Izstopimo iz For zanke
-                            EndIf
+                        If g_AbortFlag Then
+                            Exit For ' Če je MovementMonitor ustavil robota, takoj izstopimo
                         EndIf
+                        
+                        Print "Premik na tocko P", i
+                        Move P(i) /1
                     Next
                     
-                    ' KLJUCNI POPRAVEK 2: Ce smo morali prekiniti delo, takoj zapustimo notranjo zanko
-                    If abortFlag = 1 Then
-                        Exit Do
-                    EndIf
+                    ' --------------------------------------------------
+                    ' 2. ZAKLJUČEK VZPOREDNE NITI
+                    ' --------------------------------------------------
+                    g_MovementMonitorRunning = False
+                    Wait 0.05
+                    Quit MovementMonitor ' Varno ugasnemo nit
                     
-                   
-                    Write #201, "1"
-                    Print "[Robot] Nanos uspesno zakljucen!"
+                    ' --------------------------------------------------
+                    ' 3. PREVERJANJE REZULTATA NANOSA
+                    ' --------------------------------------------------
+                    If g_AbortFlag Then
+                        Print "[Robot] CIKEL PREKINJEN zaradi premika kosa! Umikam robota..."
+                        Move P0 +Z(50) ' Varen umik navzgor
+                        Exit Do        ' Prekinemo notranjo zanko
+                    Else
+                        ' Uspeh: Pošljemo Pythonu potrditev (Koda 1)
+                        Write #201, "1"
+                        Print "[Robot] Nanos uspešno zaključen!"
+                    EndIf
                 EndIf
                 
             EndIf
             
             Wait 0.02 ' Kratka pavza za razbremenitev krmilnika (20 ms)
-        Loop ' Konec notranje zanke (Loop za tocke)
-        
+        Loop ' Konec notranje zanke
         
         CloseNet #201
         Print "--- Povezava zaprta. Pripravljen na nov cikel. ---"
@@ -109,4 +115,34 @@ Function main
         
     Loop
 
+Fend
+
+' ======================================================================
+' VZPOREDNA NIT: Spremlja omrežni port za premik kosa med delom
+' ======================================================================
+Function MovementMonitor
+    String line$
+    String command$(7)
+    Int32 type
+    
+    Do While g_MovementMonitorRunning
+        ' Preverimo, če je Python poslal nov podatek preko socketa
+        If ChkNet(201) > 0 Then
+            Input #201, line$
+            ParseStr line$, command$(), " "
+            type = Val(command$(0))
+            
+            ' Če prejmemo kodo 2 (Premik kosa), TAKOJ ustavimo robota!
+            If type = 2 Then
+                Print "[MovementMonitor] ZAZNAN PREMIK IZDELKA (type=2)! Ustavljam robota!"
+                g_AbortFlag = True
+                
+                ' Ukaz AbortMotion v trenutku prekine fizično gibanje robota
+                AbortMotion
+                Exit Do
+            EndIf
+        EndIf
+        
+        Wait 0.01 ' Hitro osveževanje (vsakih 10 ms)
+    Loop
 Fend

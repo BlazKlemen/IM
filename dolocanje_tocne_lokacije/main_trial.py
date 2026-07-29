@@ -697,7 +697,7 @@ def remove_table_background(target: o3d.geometry.PointCloud,
     filter se sploh ne opira na relativno velikost ravnin v sceni, zato je
     od velikosti/oblike dela neodvisen.
 
-    Namesto tega izkoristimo fizikalno dejstvo, da del ne more segati POD
+    Namesto tega izkoristimo fizikalno dejstvo, da del ne more segati 
     mizo, na kateri leži - miza (če je v skenu sploh prisotna) je zato
     vedno pri najnižjih (ali najvišjih, glede na flip_up_direction)
     opaženih vrednostih vzdolž up_axis. table_level_percentile (namesto

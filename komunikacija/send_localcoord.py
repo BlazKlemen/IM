@@ -9,7 +9,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 # --- NASTAVITVE ZA TCP/IP ---
-TCP_IP = "127.0.0.1"   # Pusti 127.0.0.1 za simulator, spremeni v IP računalnika za realnega robota
+TCP_IP = "192.168.68.213"   # Pusti 127.0.0.1 za simulator, spremeni v IP računalnika za realnega robota
 TCP_PORT = 12345       # V Epson Port 201 nastavi enak port
 
 # Skupna deljena spremenljivka za preverjanje premika
@@ -162,16 +162,17 @@ def main():
         server_socket.close()
         return
 
-    print("[Kamera] Povezujem kamero...")
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
+    #
+    #print("[Kamera] Povezujem kamero...")
+    #cap = cv2.VideoCapture(0)
+    ##if not cap.isOpened():
         print("[Kamera] Napaka: Ni mogoče odpreti kamere.")
         global_conn.close()
         server_socket.close()
         return
-    print("[Kamera] Kamera uspešno povezana.")
+    #print("[Kamera] Kamera uspešno povezana.")
 
-    print("\nSistem pripravljen. Postavi izdelek v POI in pritisni ENTER.")
+    #print("\nSistem pripravljen. Postavi izdelek v POI in pritisni ENTER.")
     
     try: 
         while not stop_event.is_set():

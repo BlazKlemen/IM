@@ -9,7 +9,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 # --- NASTAVITVE ZA TCP/IP ---
-TCP_IP = "192.168.68.213"   # Pusti 127.0.0.1 za simulator, spremeni v IP računalnika za realnega robota
+TCP_IP = "192.168.0.10"   # ip računalnika
 TCP_PORT = 12345       # V Epson Port 201 nastavi enak port
 
 # Skupna deljena spremenljivka za preverjanje premika
@@ -183,10 +183,10 @@ def main():
                     time.sleep(0.05)
                 
                 # Pred začetkom zajamemo svežo referenčno sliko kosa za nov cikel
-                ret, frame = cap.read()
-                if not ret:
-                    print("[Kamera] Napaka pri zajemu referenčne slike za ta cikel!")
-                    continue
+                #ret, frame = cap.read()
+                #if not ret:
+                   # print("[Kamera] Napaka pri zajemu referenčne slike za ta cikel!")
+                    #continue
 
                 product_type = 1 
                 with error_lock:
@@ -217,9 +217,9 @@ def main():
         stop_event.set()
     finally:
         # Varno zapremo kamero in vtičnice ob izhodu iz celotnega programa
-        if cap and cap.isOpened():
-            cap.release()
-            cv2.destroyAllWindows()
+        #if cap and cap.isOpened():
+          #  cap.release()
+           # cv2.destroyAllWindows()
             
         if global_conn:
             try:

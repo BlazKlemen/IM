@@ -51,7 +51,7 @@ BASE_PATH = Path(__file__).resolve().parent
 # =============================================================================
 # Ime iz kamere.CAMERAS (glej ta file za celoten seznam in specifikacije) -
 # ali None, če želite vse spodnje kamera-parametre nastaviti čisto ročno.
-CAMERA = "photoneo_phoxi_s"   # "photoneo_phoxi_s" | "zivid_2plus_m60" | "mecheye_pro_s" | None
+CAMERA = "photoneo_phoxi_s"  # "photoneo_phoxi_s" | "zivid_2plus_m60" | "mecheye_pro_s" | None
 
 # Skalira izpeljano ločljivost (--camera_width_px/height_px) navzdol - prave
 # kamere imajo 2-5 Mpix, kar naredi ray casting počasen; 0.25-0.5 za hitro
@@ -74,8 +74,8 @@ CONFIG = {
     # --- Scenarij: okluzija in miza/ozadje ---
     "disable_occlusion": False,    # True = brez ray castinga, gosto vzorči cel del (diagnostika vpliva okluzije)
     "add_table_background": True,  # simulirana miza pod delom v sceni za ray casting
-    "table_size_x": 500.0,          # širina mize (mm), na kateri del leži
-    "table_size_y": 500.0,          # globina mize (mm)
+    "table_size_x": 200.0,          # širina mize (mm), na kateri del leži
+    "table_size_y": 200.0,          # globina mize (mm)
     "table_center_x": 0.0,          # X koordinata sredine mize (mm)
     "table_center_y": 0.0,          # Y koordinata sredine mize (mm)
     "remove_table_background": True,   # True/False/None (None=auto: True za use_real_scan, False za simulacijo)
@@ -85,8 +85,8 @@ CONFIG = {
     # (samo simulacija - glej modulski docstring) - to je poza, ki jo mora
     # main_trial.py sam oceniti/izračunati. translation_z je None = iz
     # izbrane kamere (negativna idealna delovna razdalja, glej CAMERA zgoraj).
-    "translation_x": 80.0,           # X pozicija dela (mm) - 0 = natanko pod kamero
-    "translation_y": 80.0,           # Y pozicija dela (mm)
+    "translation_x": 0.0,           # X pozicija dela (mm) - 0 = natanko pod kamero
+    "translation_y": 0.0,           # Y pozicija dela (mm)
     "translation_z": None,          # Z razdalja dela od kamere (mm, NEGATIVNA) - None = iz izbrane kamere
     "rotation_x_deg": 0.0,          # naklon okoli X (roll, stopinje) - testira toleranco na neravno ležečo postavitev
     "rotation_y_deg": 0.0,          # naklon okoli Y (pitch, stopinje)
@@ -117,9 +117,10 @@ CONFIG = {
     # --- Predobdelava / obrezovanje / oceni naklona ---
     "voxel_size": 1.0,                          # velikost mreže (mm) za zmanjšanje gostote oblaka točk pred registracijo
     "sample_points": 200000,                    # koliko točk vzorčimo iz CAD modela
-    "top_fraction": 0.35,                       # kolikšen delež dela (od zgoraj) dejansko "vidi" kamera
+    "top_fraction": 1,                       # kolikšen delež dela (od zgoraj) dejansko "vidi" kamera
     "up_axis": 2,                                # katera os predstavlja "navzgor" (0=X, 1=Y, 2=Z)
     "flip_up_direction": False,                 # obrne smer "navzgor", če je kamera obrnjena na drugo stran
+    "crop_edge_margin_factor": 2.0,             # izključi pas te širine (x voxel_size) tik ob meji obreza SAMO na CAD strani (glej main_trial.py --help) - 0 = izklopljeno
     "tilt_normal_top_band_fraction": 0.5,       # kolikšen delež zgornjih točk se uporabi za oceno naklona dela
     "height_percentile": 99.5,                  # percentil višine namesto najvišje točke (odpornost na osamelce)
 
@@ -130,13 +131,20 @@ CONFIG = {
 
     # --- Groba (yaw sweep) + ICP registracija ---
     "coarse_distance_factor": 3.0,              # kako širok je prag ujemanja pri grobi (yaw sweep) registraciji
-    "yaw_step_deg": 6.0,                        # kako fino (stopinje) se preiskuje rotacija okoli navpične osi - 6.0 je zdaj main_trial.py-jev privzetek (empirično enaka natančnost kot 3.0, a 2x hitreje - glej main_trial.py --help)
+    "yaw_step_deg": 3.0,                        # kako fino (stopinje) se preiskuje rotacija okoli navpične osi - 6.0 je zdaj main_trial.py-jev privzetek (empirično enaka natančnost kot 3.0, a 2x hitreje - glej main_trial.py --help)
     "yaw_sweep_refine_iterations": 5,           # koliko iteracij ICP se uporabi za oceno vsakega testnega kota
     "icp_distance_factor": 2.0,                 # kako širok je prag ujemanja pri natančni ICP registraciji
     "icp_voxel_scales": (4.0, 2.0, 1.0, 0.5),   # zaporedje velikosti mreže (od grobe do fine) za postopno ICP
     "icp_max_iterations": 100,                  # največje število iteracij ICP na posamezno stopnjo
+    "icp_iterations_schedule": None,            # neobvezen slovar {scale: iteracije} za drugačen proračun po posamezni ICP stopnji, npr. {4.0: 30, 2.0: 50, 1.0: 75, 0.5: 100} - None = povsod icp_max_iterations (glej main_trial.py --help)
     "robust_kernel_k_factor": 1.0,              # kako strogo ICP zavrača osamelce (manjša vrednost = strožje)
     "min_coarse_fitness_for_icp": 0.1,          # najnižja kakovost grobe registracije, da se sploh nadaljuje z ICP
+
+    # --- Point-to-mesh polish (Phase 4.5, glej main_trial.py --help) ---
+    "use_mesh_polish": True,                    # dodaten končni korak: poravna sken neposredno na TOČNO CAD mrežo namesto na vzorčen oblak, uteženo s heteroscedastičnim šumovnim modelom - strogo ne-regresiven (sprejet samo, če ne poslabša trimmed_rms)
+    "mesh_polish_max_iterations": 30,           # največje število iteracij tega koraka
+    "mesh_polish_distance_factor": 1.0,         # prag ujemanja (x voxel_size x najfinejši icp_voxel_scales x icp_distance_factor)
+    "mesh_polish_trim_fraction": 0.8,           # delež target točk (najbližje najprej), uporabljen za odločitev sprejmi/zavrni polish
 
     # --- Asimetrični varnostni pregled + target->source pokritost ---
     "asymmetric_check_top_fraction": 0.15,      # delež najbolj "edinstvenih" točk dela, uporabljenih za varnostni pregled
@@ -324,6 +332,7 @@ def build_cli_args(config: dict) -> list[str]:
     _value_flag(args, config["top_fraction"], "--top_fraction")
     _value_flag(args, config["up_axis"], "--up_axis")
     _bool_flag(args, config["flip_up_direction"], "--flip_up_direction")
+    _value_flag(args, config["crop_edge_margin_factor"], "--crop_edge_margin_factor")
     _value_flag(args, config["tilt_normal_top_band_fraction"], "--tilt_normal_top_band_fraction")
     _value_flag(args, config["height_percentile"], "--height_percentile")
 
@@ -341,8 +350,18 @@ def build_cli_args(config: dict) -> list[str]:
         args.append("--icp_voxel_scales")
         args.append(",".join(str(s) for s in config["icp_voxel_scales"]))
     _value_flag(args, config["icp_max_iterations"], "--icp_max_iterations")
+    if config["icp_iterations_schedule"]:   # slovar {scale: iteracije} -> "scale:iteracije,scale:iteracije,..." (glej main_trial.py --help)
+        args.append("--icp_iterations_schedule")
+        args.append(",".join(f"{scale}:{iterations}"
+                             for scale, iterations in config["icp_iterations_schedule"].items()))
     _value_flag(args, config["robust_kernel_k_factor"], "--robust_kernel_k_factor")
     _value_flag(args, config["min_coarse_fitness_for_icp"], "--min_coarse_fitness_for_icp")
+
+    # --- Point-to-mesh polish (Phase 4.5) ---
+    _bool_flag_default_true(args, config["use_mesh_polish"], "--no_mesh_polish")
+    _value_flag(args, config["mesh_polish_max_iterations"], "--mesh_polish_max_iterations")
+    _value_flag(args, config["mesh_polish_distance_factor"], "--mesh_polish_distance_factor")
+    _value_flag(args, config["mesh_polish_trim_fraction"], "--mesh_polish_trim_fraction")
 
     # --- Asimetrični varnostni pregled + target->source pokritost ---
     _value_flag(args, config["asymmetric_check_top_fraction"], "--asymmetric_check_top_fraction")

@@ -20,7 +20,7 @@ PREPROCESS_CACHE_DIR = Path(__file__).resolve().parent / ".preprocess_cache"   #
 # ključ pokriva samo *parametre*, ne verzije kode, zato bi popravek
 # brez spremembe parametra sicer še naprej neomejeno servisiral star,
 # napačen predpomnjen rezultat namesto ponovnega izračuna.
-PREPROCESS_CACHE_VERSION = 6   # trenutna verzija formata predpomnilnika
+PREPROCESS_CACHE_VERSION = 7   # trenutna verzija formata predpomnilnika - popravek: preserve_existing_normals (ohranitev točnih CAD mesh normal namesto vedno ponovne ocene, glej ensure_oriented_normals)
 
 # funkcija za vizualizacijo rezultatov registracije
 def draw_registration_result(source: o3d.geometry.PointCloud,   # izvorni oblak točk
@@ -295,9 +295,17 @@ def simulate_camera_scan(mesh: o3d.geometry.TriangleMesh,           # NEtransfor
                          table_size_x: float = 500.0,                # širina mize (mm) - ista miza kot pri fizičnem priorju v yaw_sweep_registration
                          table_size_y: float = 500.0,                # globina mize (mm)
                          table_center: Optional[np.ndarray] = None   # center mize (X/Y) - privzeto (0,0)
-                         ) -> o3d.geometry.PointCloud:
+                         ) -> tuple[o3d.geometry.PointCloud, Optional[np.ndarray], Optional[np.ndarray]]:
     """Simulira pravi globinski skener z ray castingom namesto prejšnjega
     hidden_point_removal pristopa.
+
+    Vrne (pcd, grid_points, hit_mask): pcd je sploščen oblak (kot prej);
+    grid_points/hit_mask sta (H,W,3)/(H,W) - ista zašumljena 3D pozicija in
+    maska zadetka, KI JIH `pcd` NEODVISNO SPLOŠČI, a v izvirni piksel MREŽNI
+    obliki, namesto da bi jo klicatelj (filter_grazing_incidence_points_from_grid,
+    glej run_registration) moral dražje rekonstruirati iz sploščenega
+    oblaka. disable_occlusion=True nima piksel mreže (gosto vzorčenje cele
+    mreže, ne ray casting po pikslih) - v tem primeru sta oba None.
 
     hidden_point_removal projicira točke na kroglo okoli točke pogleda in
     oceni vidljivost iz te projekcije - za to potrebuje ročno nastavljen
@@ -437,7 +445,7 @@ def simulate_camera_scan(mesh: o3d.geometry.TriangleMesh,           # NEtransfor
         effective_std = np.where(is_outlier, noise_std_mm * outlier_std_multiplier, noise_std_mm)   # večji std za osamelce
         points += np.random.normal(size=points.shape) * effective_std[:, None]   # dodamo šum vsaki točki
         pcd.points = o3d.utility.Vector3dVector(points)   # shranimo zašumljene točke nazaj v oblak
-        return pcd   # vrnemo brez ray castinga (diagnostičen način)
+        return pcd, None, None   # vrnemo brez ray castinga (diagnostičen način) - ni piksel mreže, torej grid_points/hit_mask=None (glej docstring)
 
     mesh_t = o3d.t.geometry.TriangleMesh.from_legacy(mesh)   # pretvorimo mrežo v obliko za ray casting
     scene = o3d.t.geometry.RaycastingScene()   # ustvarimo prazno sceno za ray casting
@@ -595,7 +603,15 @@ def simulate_camera_scan(mesh: o3d.geometry.TriangleMesh,           # NEtransfor
 
     pcd = o3d.geometry.PointCloud()   # ustvarimo nov, prazen oblak točk
     pcd.points = o3d.utility.Vector3dVector(points)   # vstavimo zašumljene točke
-    return pcd   # vrnemo simuliran skeniran oblak točk
+    # hit_points/hit_mask ohranjena v (H,W,...) OBLIKI (ne le sploščen
+    # `points` zgoraj) - filter_grazing_incidence_points_from_grid jih
+    # uporabi za O(n) oceno kota vpadanja iz razlik do SOSEDNJIH pikslov
+    # (križni produkt), namesto da bi klicatelj moral znova zgraditi
+    # KDTree/estimate_normals nad sploščenim oblakom (glej
+    # filter_grazing_incidence_points_from_grid docstring - prejšnja
+    # verzija je organizirano mrežo tu zavrgla in jo dražje rekonstruirala
+    # dva koraka kasneje).
+    return pcd, hit_points, hit_mask   # vrnemo simuliran skeniran oblak točk + organizirano mrežo (za filter_grazing_incidence_points_from_grid)
 
 # za nalaganje realnega skeniranja iz datoteke, za pol k bomo realno skeniral
 def load_real_scan(scan_path: Path) -> o3d.geometry.PointCloud:
@@ -678,13 +694,80 @@ def filter_grazing_incidence_points(pcd: o3d.geometry.PointCloud,
     return kept   # vrnemo oblak brez domnevnih letečih pikslov na robovih
 
 
+def filter_grazing_incidence_points_from_grid(grid_points: np.ndarray,
+                                              hit_mask: np.ndarray,
+                                              camera_location: np.ndarray,
+                                              max_incidence_deg: float = 80.0) -> o3d.geometry.PointCloud:
+    """O(n), KD-tree-prosta različica filter_grazing_incidence_points za
+    ORGANIZIRANO (H,W,3)/(H,W) mrežo - glej simulate_camera_scan, ki jo zdaj
+    vrne poleg sploščenega oblaka. Namesto estimate_normals (KDTreeSearchParamHybrid,
+    O(n log n), na noben poseben način ne izkorišča, da je oblak dejansko
+    prišel iz pravilne pravokotne piksel mreže) izračuna normalo VSAKEGA
+    piksla neposredno iz križnega produkta razlik do DESNEGA in SPODNJEGA
+    soseda v sami mreži - standarden pristop pri organiziranih globinskih
+    slikah (isti razlog, zakaj kamere.py-jeva prava kamera dostavi
+    organizirano globinsko sliko, ne surov seznam točk).
+
+    Piksel brez uporabnega soseda (rob slike, ali sosed brez zadetka -
+    hit_mask False) OBDRŽI (normala ni ocenljiva -> ni podlage za odločitev,
+    da gre za grazing-incidence piksel; to je konzervativno, isto kot
+    prejšnji KD-tree pristop na robovih redkih/okludiranih regij, kjer
+    estimate_normals prav tako vrne šibko določeno normalo).
+
+    Uporablja isto (zašumljeno) grid_points geometrijo, ki jo je
+    simulate_camera_scan dejansko izpljunil - NE ground-truth primitive_normals,
+    ki jih ray casting notranje pozna (to bi bilo "prevarantsko": prava
+    kamera nima dostopa do resnične CAD geometrije, samo do svoje lastne
+    (šumne) izmerjene globinske slike, zato mora tudi ta filter oceniti
+    normalo iz istih šumnih meritev, ne iz privilegiranega ground-trutha)."""
+    h, w, _ = grid_points.shape
+    right_hit = np.zeros((h, w), dtype=bool)
+    right_hit[:, :-1] = hit_mask[:, :-1] & hit_mask[:, 1:]   # ima desnega soseda, oba zadetka
+    down_hit = np.zeros((h, w), dtype=bool)
+    down_hit[:-1, :] = hit_mask[:-1, :] & hit_mask[1:, :]   # ima spodnjega soseda, oba zadetka
+    has_both_neighbors = right_hit & down_hit   # ima OBA soseda - edini piksli, kjer je normala ocenljiva
+
+    dx = np.zeros((h, w, 3))
+    dx[:, :-1] = grid_points[:, 1:] - grid_points[:, :-1]   # razlika do desnega soseda
+    dy = np.zeros((h, w, 3))
+    dy[:-1, :] = grid_points[1:, :] - grid_points[:-1, :]   # razlika do spodnjega soseda
+    cross = np.cross(dx, dy)   # smer normale (predznak nedoločen - ni pomembno, glej abs() spodaj)
+    cross_len = np.linalg.norm(cross, axis=-1)
+    valid_normal = has_both_neighbors & (cross_len > 1e-9)   # dodatno izključimo degenerirane (kolinearne) primere
+
+    points_flat = grid_points.reshape(-1, 3)
+    hit_flat = hit_mask.reshape(-1)
+    valid_flat = valid_normal.reshape(-1)
+    normal_flat = np.zeros((h * w, 3))
+    normal_flat[valid_flat] = (cross.reshape(-1, 3)[valid_flat] /
+                               cross_len.reshape(-1)[valid_flat, None])   # normalizirane normale samo tam, kjer so ocenljive
+
+    view_dir = camera_location - points_flat[valid_flat]   # smer od vsake ocenljive točke proti kameri
+    view_dir /= np.clip(np.linalg.norm(view_dir, axis=-1, keepdims=True), 1e-12, None)
+    incidence_cos = np.clip(np.abs(np.sum(view_dir * normal_flat[valid_flat], axis=-1)), -1.0, 1.0)
+    incidence_deg = np.degrees(np.arccos(incidence_cos))
+    drop_local = incidence_deg > max_incidence_deg   # kateri od ocenljivih pikslov presežejo prag
+
+    keep_flat = hit_flat.copy()
+    valid_indices = np.where(valid_flat)[0]
+    keep_flat[valid_indices[drop_local]] = False   # zavrnemo samo tiste, kjer JE bila normala ocenljiva IN je presegla prag
+
+    kept_points = points_flat[keep_flat]
+    pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(kept_points))
+    n_hit = int(hit_flat.sum())
+    print(f"  filter_grazing_incidence_points_from_grid: removed {n_hit - len(kept_points)}/{n_hit} "
+          f"points with incidence angle > {max_incidence_deg:.0f} deg "
+          f"({100 * len(kept_points) / max(n_hit, 1):.1f}% kept) [O(n) grid-based, no KD-tree]")
+    return pcd
+
+
 def remove_table_background(target: o3d.geometry.PointCloud,
                             up_axis: int,
                             flip_up_direction: bool,
                             part_height_mm: float,
                             cropped_region_height_mm: Optional[float] = None,
                             margin_mm: float = 10.0,
-                            table_level_percentile: float = 1.0) -> o3d.geometry.PointCloud:
+                            table_level_percentile: float = 1.0) -> tuple[o3d.geometry.PointCloud, np.ndarray]:
     """Odstrani domnevne mizne/ozadje točke iz target, na podlagi ZNANE
     višine dela (part_height_mm, iz source/CAD modela - vedno na voljo in
     natančno znana, ne glede na velikost ali obliko dela v XY), namesto
@@ -740,7 +823,17 @@ def remove_table_background(target: o3d.geometry.PointCloud,
           f"keeping band ({lower_cutoff:.2f}, {upper_cutoff:.2f}) - "
           f"kept {len(kept.points)}/{len(points)} points "
           f"({100 * len(kept.points) / max(len(points), 1):.1f}%)")
-    return kept   # vrnemo target brez domnevnih mizno/ozadje točk
+    # keep_mask je vrnjen poleg `kept` (ne le uporabljen interno), da lahko
+    # run_registration z njim posodobi target_hit_mask (glej Phase 2) in
+    # tako obdrži organizirano (H,W) mrežo usklajeno z target-om tudi PO tem
+    # klicu - brez tega bi target_hit_mask po remove_table_background
+    # kazal na zastarelo (predodstranitveno) množico točk, kar bi
+    # filter_grazing_incidence_points_from_grid naredilo nepravilnega
+    # (znova bi vrnil že odstranjene mizne/ozadje točke). keep_mask je
+    # poravnan ena-na-ena z `points` (torej s target-om PRED tem klicem) -
+    # klicatelj ga poravna na target_hit_mask.reshape(-1) prek indeksov, kjer
+    # je bil hit_mask True (glej run_registration).
+    return kept, keep_mask   # vrnemo target brez domnevnih mizno/ozadje točk + keep_mask
 
 
 # pravilno orientera normalne vektorje v oblaku točk, da so skladni z oblakomточk
@@ -749,9 +842,28 @@ def ensure_oriented_normals(pcd: o3d.geometry.PointCloud,  # oblak točk, ki ga 
                             is_partial_view: bool,  # če je True, pomeni, da oblak točk predstavlja delno vidno površino objekta (npr. skeniranje iz ene kamere), če je False, pomeni, da oblak točk predstavlja celotno zaprto površino objekta (npr. CAD model)
                             camera_location: np.ndarray = np.array([0.0, 0.0, 0.0]),    # lokacija kamere, ki se uporablja za orientacijo normalnih vektorjev, če je is_partial_view=True
                             max_nn: int = 30,   # maksimalno število sosednjih točk, ki se upoštevajo pri izračunu normalne za vsako točko, večje število pomeni bolj gladke normale, vendar počasnejše izračune
-                            use_knn: bool = False) -> None:     # Če je True, se uporabi KNN (k-nearest neighbors) metoda za izračun normalnih vektorjev, sicer se uporabi hibridna metoda z radijem
-                                                                # False --> enakomerni oblaki točk, True --> neenakomerni oblaki točk
-    if use_knn:
+                            use_knn: bool = False,     # Če je True, se uporabi KNN (k-nearest neighbors) metoda za izračun normalnih vektorjev, sicer se uporabi hibridna metoda z radijem
+                                                        # False --> enakomerni oblaki točk, True --> neenakomerni oblaki točk
+                            preserve_existing_normals: bool = False) -> None:   # če je True IN pcd že ima normale, se estimate_normals PRESKOČI (samo normalizira in preusmeri obstoječe) - glej docstring
+    """preserve_existing_normals=True ohrani pcd-jeve OBSTOJEČE normale (le
+    normalizirane in nato usmerjene, glej is_partial_view spodaj), namesto da
+    bi jih pcd.estimate_normals() prepisal s ponovno OCENJENIMI (KNN/radij)
+    normalami. Namenjeno CAD oblakom, ki izvirajo iz
+    mesh.sample_points_poisson_disk() na mreži s
+    KLICANIM mesh.compute_vertex_normals() (glej load_cad_model) - taki
+    oblaki že nosijo TOČNE, iz CAD geometrije interpolirane normale, ki jih
+    tudi voxel_down_sample pravilno POVPREČI (ne uniči). Prejšnje
+    brezpogojno estimate_normals() je te točne normale vedno prepisalo z
+    manj natančnimi, iz same (redke, downsamplirane) točkovne geometrije
+    OCENJENIMI normalami - v refine_registration-ovem ICP koraku, kjer
+    Open3D-jev point-to-plane bere normale s CAD strani (glej refine_registration
+    docstring "ICP smer je OBRNJENA"), je to neposredno pomenilo nižjo
+    natančnost, ki je šla naravnost v rešitev. Če pcd nima normal (npr.
+    surov sken), se ta zastavica ignorira in normale se ocenijo kot prej -
+    zato je varno pustiti False za sken/target povsod."""
+    if preserve_existing_normals and pcd.has_normals():
+        pcd.normalize_normals()   # voxel_down_sample povpreči obstoječe normale po celicah - rezultat ni nujno natanko enotske dolžine
+    elif use_knn:
         pcd.estimate_normals(o3d.geometry.KDTreeSearchParamKNN(knn=max_nn))     # normalo oceni glede na najbližje točke, ne glede na njihovo oddaljenost
     else:
         pcd.estimate_normals(
@@ -774,18 +886,35 @@ def ensure_oriented_normals(pcd: o3d.geometry.PointCloud,  # oblak točk, ki ga 
 def crop_top_region(pcd: o3d.geometry.PointCloud,  # vhodni oblak točk, ki ga želimo odrezat
                     top_fraction: float = 0.35,     # obdrži 35% zgornjega dela oblaka točk
                     up_axis: int = 2,               # os, ki predstavlja 'gor' (0=x, 1=y, 2=z), privzeto je z os
-                    flip_up_direction: bool = False) -> o3d.geometry.PointCloud:
+                    flip_up_direction: bool = False,
+                    edge_margin: float = 0.0) -> o3d.geometry.PointCloud:   # dodatno izključi pas te širine tik ob (umetni) meji obreza - glej docstring spodaj
+    """edge_margin (privzeto 0.0, brez spremembe obnašanja): dodatno izключi
+    pas širine edge_margin TIK OB meji obreza (cutoff spodaj), ne od
+    prave/fizične strani oblaka (max_bound stran pri not flip_up_direction,
+    min_bound stran pri flip_up_direction - to je resnična zgornja ploskev
+    dela, ne umeten rob).
+
+    Zakaj: cutoff sam je UMETNA meja, ki jo ustvari to obrezovanje (del/mreža
+    se v resnici razteza dlje, mi ga tu preprosto odrežemo) - v target-u
+    (dejanski sken) lahko na tej višini sensor vidi material POD mejo (ali pa
+    ne, odvisno od okluzije), CAD (source) pa se na cutoff natanko konča.
+    Točke source-a znotraj edge_margin od cutoff-a zato sistematično
+    (pristransko, ne naključno) vlečejo ICP rešitev - klicatelj naj to
+    uporabi SAMO na strani, ki jo primerja z drugim oblakom (source v
+    run_registration), ne na mesh-u, iz katerega se simulira/generira target
+    (simulate_camera_scan-ov lasten crop_top_region klic) - target naj
+    ostane fizikalno resničen, obreže naj se samo to, S ČIM ga primerjamo."""
     min_bound = pcd.get_min_bound()         # poišče skrajne točke oblaka točk
     max_bound = pcd.get_max_bound()   # zgornja meja oblaka točk po vseh oseh
     if not flip_up_direction:               # sam izračuna kok je treba odrezat
         cutoff = max_bound[up_axis] - top_fraction * (max_bound[up_axis] - min_bound[up_axis])   # meja, pod katero obrežemo
         crop_min = min_bound.copy()   # spodnja meja izreza - dvignjena na cutoff
-        crop_min[up_axis] = cutoff
+        crop_min[up_axis] = cutoff + edge_margin   # + edge_margin: izključi pas tik nad umetno mejo
         bbox = o3d.geometry.AxisAlignedBoundingBox(crop_min, max_bound)   # škatla, ki zajame samo zgornji del
     else:                               # isto sam obratno, če je flip_up_direction=True
         cutoff = min_bound[up_axis] + top_fraction * (max_bound[up_axis] - min_bound[up_axis])   # meja, nad katero obrežemo
         crop_max = max_bound.copy()   # zgornja meja izreza - znižana na cutoff
-        crop_max[up_axis] = cutoff
+        crop_max[up_axis] = cutoff - edge_margin   # - edge_margin: izključi pas tik pod umetno mejo
         bbox = o3d.geometry.AxisAlignedBoundingBox(min_bound, crop_max)   # škatla, ki zajame samo spodnji del
     return pcd.crop(bbox)   # obrežemo oblak točk na to škatlo
 
@@ -845,7 +974,8 @@ def preprocess_point_cloud(pcd: o3d.geometry.PointCloud,
                            is_partial_view: bool = False,
                            camera_location: np.ndarray = np.array([0.0, 0.0, 0.0]),
                            cache_key: Optional[str] = None,
-                           use_cache: bool = True) -> o3d.geometry.PointCloud:
+                           use_cache: bool = True,
+                           preserve_existing_normals: bool = False) -> o3d.geometry.PointCloud:
     """Zmanjša gostoto pcd (voxel downsampling) in izračuna pravilno
     orientirane normale - vse, kar yaw_sweep_registration in
     večnivojski ICP dejansko potrebujeta.
@@ -853,11 +983,15 @@ def preprocess_point_cloud(pcd: o3d.geometry.PointCloud,
     cache_key identificira *vhod* (npr. "source_partname_20000pts_top0.35_axis2") -
     skupaj z vsemi parametri spodaj, ki vplivajo na izhod, tvori pot do
     predpomnilnika.
-    """
+
+    preserve_existing_normals: posredovano naprej v ensure_oriented_normals
+    (glej njen docstring) - True za CAD source (točne mesh normale, glej
+    load_cad_model), False (privzeto) za sken/target (nima uporabnih normal
+    pred to funkcijo, mora jih oceniti)."""
     cache_path = None
     if cache_key is not None and use_cache:   # predpomnilnik je omogočen in imamo ključ
         params = (PREPROCESS_CACHE_VERSION, voxel_size, is_partial_view,
-                  tuple(np.round(np.asarray(camera_location), 3)))   # vsi parametri, ki vplivajo na izhod
+                  tuple(np.round(np.asarray(camera_location), 3)), preserve_existing_normals)   # vsi parametri, ki vplivajo na izhod
         digest = hashlib.md5(repr(params).encode()).hexdigest()[:10]   # kratek hash teh parametrov
         PREPROCESS_CACHE_DIR.mkdir(exist_ok=True)   # ustvarimo mapo za predpomnilnik, če še ne obstaja
         # cache_key je berljiv za človeka (npr. "source_partname_20000pts_top0.35_axis2"),
@@ -888,7 +1022,8 @@ def preprocess_point_cloud(pcd: o3d.geometry.PointCloud,
     pcd_down = pcd.voxel_down_sample(voxel_size)    # naredi 3d mrežo kock, v vsaki kocki vzame eno točko (povprečje), da zmanjša število točk in pospeši izračune
 
     ensure_oriented_normals(pcd_down, normal_radius=voxel_size * 2.0, is_partial_view=is_partial_view,
-                            camera_location=camera_location) # pokliče funkcijo od prej
+                            camera_location=camera_location,
+                            preserve_existing_normals=preserve_existing_normals) # pokliče funkcijo od prej
 
     if cache_path is not None:   # shranimo rezultat za naslednji zagon
         o3d.io.write_point_cloud(str(cache_path.parent / (cache_path.name + ".ply")), pcd_down)
@@ -1152,7 +1287,7 @@ def yaw_sweep_registration(source_down: o3d.geometry.PointCloud,
                            target_down: o3d.geometry.PointCloud,
                            voxel_size: float,
                            up_axis: int = 2,
-                           yaw_step_deg: float = 6.0,
+                           yaw_step_deg: float = 3.0,
                            distance_threshold_factor: float = 3.0,
                            refine_iterations: int = 5,
                            translation_grid_resolution: Optional[float] = None,
@@ -1341,6 +1476,35 @@ def yaw_sweep_registration(source_down: o3d.geometry.PointCloud,
     return result   # vrnemo rezultat groba registracije
 
 
+def trimmed_rms_target_to_source(source: o3d.geometry.PointCloud,
+                                 target: o3d.geometry.PointCloud,
+                                 transformation: np.ndarray,
+                                 trim_fraction: float = 0.8) -> float:
+    """Trimmed RMS distance (mm) from every target (scan) point to the nearest
+    source (CAD) surface point under `transformation`, keeping only the
+    closest `trim_fraction` of points before squaring/averaging.
+
+    Used by refine_registration to rank ICP-stage candidates INSTEAD OF a
+    fitness>=0.9*max_fitness eligibility cutoff followed by min(inlier_rmse):
+    that inlier_rmse is conditioned on a fixed correspondence threshold, so a
+    pose that matches fewer, tighter points can win over one that's actually
+    more accurate but keeps slightly more (looser) correspondences - and the
+    0.9 cutoff itself is an unjustified free parameter. This is a single,
+    threshold-free scalar: same target->source direction/interpretation as
+    evaluate_target_coverage (robust to occlusion, since target is always a
+    partial view of source - see that function's docstring), just continuous
+    instead of thresholded. Trimming (discarding the worst-matching tail,
+    not a hard accept/reject line) keeps a handful of occluded/outlier
+    target points from dominating the score, without needing a
+    correspondence-distance parameter at all."""
+    source_transformed = copy.deepcopy(source)
+    source_transformed.transform(transformation)
+    dist = np.asarray(target.compute_point_cloud_distance(source_transformed))
+    n_keep = max(1, int(np.ceil(len(dist) * trim_fraction)))
+    trimmed = np.partition(dist, n_keep - 1)[:n_keep] if n_keep < len(dist) else dist
+    return float(np.sqrt(np.mean(trimmed ** 2)))
+
+
 def refine_registration(source: o3d.geometry.PointCloud,
                         target: o3d.geometry.PointCloud,
                         init_transformation: np.ndarray,
@@ -1348,10 +1512,12 @@ def refine_registration(source: o3d.geometry.PointCloud,
                         icp_distance_factor: float = 2.0,
                         icp_voxel_scales: tuple[float, ...] = (4.0, 2.0, 1.0, 0.5),
                         source_camera_location: np.ndarray = np.array([0.0, 0.0, 0.0]),
-                        target_camera_location: np.ndarray = np.array([0.0, 0.0, 0.0]),
+                        target_camera_location: np.ndarray = np.array([0.0, 0.0, 0.0]),   # trenutno neuporabljen znotraj te funkcije - glej docstring "ICP smer je OBRNJENA" (target_stage ne rabi več normal). Ohranjen v podpisu zaradi stabilnosti klicnega vmesnika/simetrije s source_camera_location
                         common_eval_threshold_factor: float = 1.5,
                         icp_max_iterations: int = 100,
-                        robust_kernel_k_factor: float = 1.0) -> o3d.pipelines.registration.RegistrationResult:
+                        icp_iterations_schedule: Optional[dict[float, int]] = None,
+                        robust_kernel_k_factor: float = 1.0,
+                        candidate_trim_fraction: float = 0.8) -> o3d.pipelines.registration.RegistrationResult:
     """Postopen (večnivojski, coarse-to-fine) point-to-plane ICP.
 
     En sam korak pri polni ločljivosti se muči, kadar imata source (gost -
@@ -1398,57 +1564,316 @@ def refine_registration(source: o3d.geometry.PointCloud,
     Poceni sprememba (ena vrstica), ki tipično opazno zniža rmse na šumnih
     (pravih) skenih, ne da bi spremenila obnašanje na čistih podatkih, kjer
     itak ni kaj izklopiti.
+
+    ICP smer je OBRNJENA glede na intuitivno source->target: registration_icp
+    tu dobi (target_stage, source_stage, ..., inv(current_transformation), ...)
+    in rezultat se nato invertira nazaj (current_transformation =
+    inv(result.transformation)) - source (CAD) ostane source v vsakem drugem
+    pogledu (vrnjena transformacija, evaluate_registration klici spodaj, ves
+    preostali cevovod). Razlog: Open3D-jev TransformationEstimationPointToPlane
+    bere normale SAMO od svojega drugega argumenta ("target" v Open3D-jevem
+    klicnem podpisu). Prej je bil to target_stage = sken - point-to-plane
+    residual se je torej projiciral na normale, OCENJENE iz šumnih skeniranih
+    točk (KNN/estimate_normals), ne na TOČNE CAD normale (iz sample_points_
+    poisson_disk, interpolirane iz mesh.compute_vertex_normals() - glej
+    ensure_oriented_normals-ov preserve_existing_normals). Z obrnjeno smerjo
+    Open3D namesto tega bere source_stage-ove (CAD-ove, točne) normale za
+    residual, target_stage-ove pa preprosto ne uporabi (source_stage tu
+    dejansko ostane brez uporabljenih normal, glej klic ensure_oriented_normals
+    nanj spodaj - ohranjen zaradi simetrije/berljivosti kode in ker bi jih
+    prihodnja sprememba nazaj utegnila rabiti). To hkrati popravi drug,
+    ločen problem: v izvirni smeri Open3D za VSAKO CAD (source) točko išče
+    najbližjo sken (target) točko - CAD je gost in pokriva celo obrezano
+    regijo, sken pa vidi le njen del (okluzija), zato veliko CAD točk nima
+    pravega para in se ujame s karkoli znotraj praga (lažne korespondence). V
+    obrnjeni smeri ima vsaka poizvedovalna (sken) točka resničen CAD par -
+    ista logika, s katero je že prej utemeljen evaluate_target_coverage
+    (target->source, robustno na okluzijo) namesto icp_result.fitness
+    (source->target) kot glavne PASS/FAIL metrike v run_registration.
+
+    icp_iterations_schedule (neobvezno): slovar {scale: max_iteration},
+    ključi ujemajoči se z vrednostmi v icp_voxel_scales - dovoli drugačen
+    iteracijski proračun po posameznem koraku (npr. manj iteracij pri grobem
+    merilu, kjer je večina dela že opravljena v yaw sweep-u, več pri finem).
+    Manjkajoč scale v slovarju (ali None, privzeto) pade nazaj na
+    icp_max_iterations za ta korak - obstoječe klice/privzetke torej ne
+    spremeni, dokler jih klicatelj eksplicitno ne poda.
     """
     common_threshold = voxel_size * common_eval_threshold_factor   # skupen prag za pošteno primerjavo vseh korakov
-    baseline_eval = evaluate_registration(source, target, init_transformation, common_threshold)   # ocena začetnega (grobega) približka
+
+    # Kandidati se ocenjujejo in RAZVRŠČAJO na tej (grobo zmanjšani, deljeni
+    # za CEL klic refine_registration) ločljivosti, ne na polni source/
+    # target (~70k+ točk) - relativna razvrstitev med kandidati se s tem ne
+    # spremeni, prihrani pa se več odvečnih KD-tree/razdaljnih izračunov na
+    # vsak korak (baseline + vsak ICP korak, prej vsak na polni ločljivosti).
+    # Sama ICP optimizacija (spodaj, source_stage/target_stage) ostane na
+    # svoji lastni, finejši, po-korakih padajoči ločljivosti - to velja SAMO
+    # za ocenjevanje/izbiro kandidatov. Polna ločljivost je pridržana za
+    # run_registration-ov lasten, KONČNI, poročan evaluate_registration/
+    # evaluate_target_coverage klic po tej funkciji.
+    source_eval = source.voxel_down_sample(voxel_size)
+    target_eval = target.voxel_down_sample(voxel_size)
+
+    baseline_eval = evaluate_registration(source_eval, target_eval, init_transformation, common_threshold)   # ocena začetnega (grobega) približka
+    baseline_trimmed_rms = trimmed_rms_target_to_source(source_eval, target_eval, init_transformation, candidate_trim_fraction)
     print(f"  ICP baseline (coarse seed) under common threshold {common_threshold:.3f}: "
-          f"fitness={baseline_eval.fitness:.4f}, inlier_rmse={baseline_eval.inlier_rmse:.4f}")
-    candidates = [(init_transformation, baseline_eval.fitness, baseline_eval.inlier_rmse)]   # seznam kandidatov, začne z začetnim približkom
+          f"fitness={baseline_eval.fitness:.4f}, inlier_rmse={baseline_eval.inlier_rmse:.4f}, "
+          f"trimmed_rms={baseline_trimmed_rms:.4f}")
+    candidates = [(init_transformation, baseline_eval.fitness, baseline_eval.inlier_rmse, baseline_trimmed_rms)]   # seznam kandidatov, začne z začetnim približkom
 
     current_transformation = init_transformation   # trenutno najboljša transformacija, izboljšuje se skozi korake
     for scale in sorted(icp_voxel_scales, reverse=True):   # gremo od najbolj grobega merila proti najfinejšemu
         stage_voxel_size = voxel_size * scale   # velikost voxla za ta korak
         distance_threshold = stage_voxel_size * icp_distance_factor   # prag ujemanja točk za ta korak
+        stage_iterations = (icp_iterations_schedule.get(scale, icp_max_iterations)
+                           if icp_iterations_schedule else icp_max_iterations)   # glej docstring - privzeto icp_max_iterations za vsak korak
         source_stage = source.voxel_down_sample(stage_voxel_size)   # source, zmanjšan na to gostoto
         target_stage = target.voxel_down_sample(stage_voxel_size)   # target, zmanjšan na to gostoto
         # use_knn=True iz istega razloga kot pri preračunu s polno
         # ločljivostjo drugje - gostota target-a ni enakomerna niti po
         # zmanjšanju gostote (omejitveni dejavnik je okluzija, ne velikost
-        # voxla).
+        # voxla). source_stage ohrani CAD-ove TOČNE normale (preserve_existing_normals=True
+        # - voxel_down_sample jih pravilno povpreči, glej ensure_oriented_normals),
+        # namesto da bi jih znova (in slabše) ocenil iz downsampliranih točk
+        # brez povezave z izvirno mrežo.
+        #
+        # target_stage NAMERNO nima izračunanih normal: po obrnjeni ICP
+        # smeri spodaj (glej docstring "ICP smer je OBRNJENA") je
+        # target_stage Open3D-jev PRVI (source) argument, TransformationEstimationPointToPlane
+        # pa bere normale SAMO od svojega DRUGEGA (target) argumenta -
+        # source_stage. target_stage-ove normale bi torej bile v celoti
+        # zavržene (nikoli prebrane) - prejšnja različica te datoteke jih je
+        # kljub temu vsakič računala (glej camera_benchmark.py-jev opozorilni
+        # profil), to je bila čista zapravljena KDTree/estimate_normals
+        # poizvedba na vsak ICP korak.
         ensure_oriented_normals(source_stage, normal_radius=stage_voxel_size * 2.0, is_partial_view=True,
-                                camera_location=source_camera_location, use_knn=True)   # normale source-a za ta korak
-        ensure_oriented_normals(target_stage, normal_radius=stage_voxel_size * 2.0, is_partial_view=True,
-                                camera_location=target_camera_location, use_knn=True)   # normale target-a za ta korak
+                                camera_location=source_camera_location, use_knn=True,
+                                preserve_existing_normals=True)   # normale source-a (CAD, točne) za ta korak - edine, ki jih point-to-plane spodaj dejansko prebere
         robust_kernel_k = stage_voxel_size * robust_kernel_k_factor   # skala Tukeyjevega jedra za ta korak, glej docstring
         print(f"  ICP stage voxel_size={stage_voxel_size:.3f}, distance_threshold={distance_threshold:.3f}, "
-              f"robust_kernel_k={robust_kernel_k:.3f}, "
+              f"robust_kernel_k={robust_kernel_k:.3f}, max_iterations={stage_iterations}, "
               f"source={len(source_stage.points)} pts, target={len(target_stage.points)} pts")
         loss = o3d.pipelines.registration.TukeyLoss(k=robust_kernel_k)   # robustno jedro - navadni osamelci/leteči piksli znotraj praga dobijo zniževano/izničeno težo namesto polne
+        # Obrnjena smer (target_stage, source_stage, ...) - glej docstring
+        # "ICP smer je OBRNJENA" zgoraj. current_transformation preslika
+        # source(CAD)->target(sken), torej inv(current_transformation)
+        # preslika target->source, kar je init za TA klic (ker je zdaj source
+        # argument te funkcije == prejšnji target_stage).
         result = o3d.pipelines.registration.registration_icp(
-            source_stage, target_stage, distance_threshold, current_transformation,
+            target_stage, source_stage, distance_threshold, np.linalg.inv(current_transformation),
             o3d.pipelines.registration.TransformationEstimationPointToPlane(loss),
-            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=icp_max_iterations))   # poženemo point-to-plane ICP za ta korak
-        print(f"    fitness={result.fitness:.4f}, inlier_rmse={result.inlier_rmse:.4f}")
-        current_transformation = result.transformation   # posodobimo trenutno transformacijo za naslednji, finejši korak
+            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=stage_iterations))   # poženemo point-to-plane ICP za ta korak
+        print(f"    fitness={result.fitness:.4f}, inlier_rmse={result.inlier_rmse:.4f} (target(sken)->source(CAD) smer)")
+        current_transformation = np.linalg.inv(result.transformation)   # nazaj v source(CAD)->target(sken) konvencijo za naslednji korak in klicatelja
 
-        stage_eval = evaluate_registration(source, target, current_transformation, common_threshold)   # ocenimo ta korak pod skupnim pragom
+        stage_eval = evaluate_registration(source_eval, target_eval, current_transformation, common_threshold)   # ocenimo ta korak pod skupnim pragom
+        stage_trimmed_rms = trimmed_rms_target_to_source(source_eval, target_eval, current_transformation, candidate_trim_fraction)
         print(f"    under common threshold {common_threshold:.3f}: fitness={stage_eval.fitness:.4f}, "
-              f"inlier_rmse={stage_eval.inlier_rmse:.4f}")
-        candidates.append((current_transformation, stage_eval.fitness, stage_eval.inlier_rmse))   # dodamo ta korak med kandidate
+              f"inlier_rmse={stage_eval.inlier_rmse:.4f}, trimmed_rms={stage_trimmed_rms:.4f}")
+        candidates.append((current_transformation, stage_eval.fitness, stage_eval.inlier_rmse, stage_trimmed_rms))   # dodamo ta korak med kandidate
 
-    max_fitness = max(fitness for _, fitness, _ in candidates)   # najboljša videna fitness med vsemi kandidati
-    fitness_tolerance = 0.9   # kandidat mora doseči vsaj 90% najboljše fitness, da je upravičen
-    eligible = [c for c in candidates if c[1] >= max_fitness * fitness_tolerance]   # kandidati, ki niso zares divergirali
-    best_transformation, best_fitness, best_rmse = min(eligible, key=lambda c: c[2])   # med njimi izberemo z najnižjim inlier_rmse
-    print(f"  Selected transformation with fitness={best_fitness:.4f}, inlier_rmse={best_rmse:.4f} "
-          f"(lowest inlier_rmse among candidates within {fitness_tolerance:.0%} of the best "
-          f"fitness seen, {max_fitness:.4f})")
+    # Izbira z najnižjim trimmed_rms - glej trimmed_rms_target_to_source
+    # docstring za razlog, zakaj to nadomesti prejšnji fitness>=0.9*max
+    # eligibility-cutoff + min(inlier_rmse) par: ena sama, threshold-free
+    # skalarna ocena, po konstrukciji odporna na osamelce/okluzijo, brez
+    # nobenega prostega/neutemeljenega parametra.
+    best_transformation, best_fitness, best_rmse, best_trimmed_rms = min(candidates, key=lambda c: c[3])
+    print(f"  Selected transformation with fitness={best_fitness:.4f}, inlier_rmse={best_rmse:.4f}, "
+          f"trimmed_rms={best_trimmed_rms:.4f} (lowest trimmed target->CAD RMS distance, "
+          f"{candidate_trim_fraction:.0%} of target points, among all {len(candidates)} candidates)")
 
     best_eval = o3d.pipelines.registration.RegistrationResult()   # ustvarimo objekt za končni rezultat
     best_eval.transformation = best_transformation   # izbrana najboljša transformacija
     best_eval.fitness = best_fitness   # njena fitness vrednost
     best_eval.inlier_rmse = best_rmse   # njena natančnost
     return best_eval   # vrnemo končni, izboljšan rezultat
+
+
+# ---------------------------------------------------------------------------
+# Point-to-mesh (RaycastingScene) ICP polish: dodaten, KONČNI natančnostni
+# korak po refine_registration, ki sken poravna neposredno na TOČNO CAD
+# mrežo (trikotnike same STL datoteke), ne na Poisson-disk VZORČEN CAD
+# oblak točk. Vzorčen oblak ima pri sample_point_count=200000 v obrezani
+# regiji razmik ~0.5mm - to je diskretizacijska talna meja, pod katero noben
+# ICP na točkovnem oblaku (vključno z refine_registration zgoraj) ne more
+# priti, ne glede na število iteracij ali finost voxel_size. Mreža sama
+# nima te omejitve - vsaka poizvedba dobi TOČNO najbližjo točko na dejanski
+# ploskvi, ne najbližji vzorčeni sosed.
+#
+# Dodatno uteži vsako sken točko z 1/sigma^2 (heteroscedastic_noise_std_mm,
+# isti šumovni model, ki ga simulate_camera_scan uporabi za generiranje
+# šuma) namesto enake teže za vse - točka pri strmem kotu vpadanja ima
+# fizikalno vecji šum in bi morala prispevati sorazmerno manj k rešitvi,
+# ne glede na to, kako blizu je slučajno pristala (Tukey/robust_kernel_k
+# sam po sebi to NE naredi - on uteži po velikosti RESIDUALA, ne po vnaprej
+# znani meritveni negotovosti).
+# ---------------------------------------------------------------------------
+
+def build_cad_raycasting_scene(mesh: o3d.geometry.TriangleMesh) -> o3d.t.geometry.RaycastingScene:
+    """RaycastingScene (BVH nad TOČNIMI trikotniki CAD mreže), uporabljen v
+    point_to_mesh_icp za natančne closest-point/normal poizvedbe - isti
+    razred, ki ga simulate_camera_scan že uporablja za ray casting, tu pa
+    za nearest-surface-point poizvedbe namesto sprožanja žarkov."""
+    mesh_t = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(mesh_t)
+    return scene
+
+
+def raycasting_closest_point_fn(scene: o3d.t.geometry.RaycastingScene):
+    """Ovije o3d.t.geometry.RaycastingScene.compute_closest_points v
+    preprost callable (p_cad -> (proj, normal)) za point_to_mesh_icp - ta
+    posredniški nivo dovoli, da je point_to_mesh_icp sam testiran s čisto
+    numpy/analitičnimi closest_point_fn (glej modulske self-teste), brez
+    odvisnosti od Open3D-jevega Tensor API-ja."""
+    def closest_point_fn(p_cad: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        query = o3d.core.Tensor(p_cad.astype(np.float32))
+        result = scene.compute_closest_points(query)
+        proj = result["points"].numpy().astype(np.float64)
+        normal = result["primitive_normals"].numpy().astype(np.float64)
+        return proj, normal
+    return closest_point_fn
+
+
+def point_to_mesh_icp(scan_points: np.ndarray,
+                      closest_point_fn,
+                      init_transformation: np.ndarray,
+                      max_iterations: int = 30,
+                      max_correspondence_distance: float = np.inf,
+                      robust_kernel_k: Optional[float] = None,
+                      point_sigma_mm: Optional[np.ndarray] = None,
+                      convergence_translation_tol_mm: float = 1e-4,
+                      convergence_rotation_tol_deg: float = 1e-3) -> dict:
+    """Point-to-plane ICP, kjer je "target" TOČNA CAD površina
+    (closest_point_fn - glej raycasting_closest_point_fn), namesto
+    Poisson-disk VZORČENEGA CAD oblaka točk. scan_points so v SVETOVNEM
+    (kamera/sken) okviru, popolnoma NEtransformirane (surove sken točke) -
+    ista konvencija kot povsod drugje v tej datoteki (source=CAD v
+    lastnem/CAD okviru, target=sken v svetovnem okviru, transformacija
+    slika CAD->svet).
+
+    Vsaka iteracija:
+      1. Transformira scan_points v CAD okvir s trenutno oceno (world_to_cad
+         = inv(trenutna CAD->svet transformacija)).
+      2. Poizveduje najbližjo točko/normalo na CAD površini za vsako (glej
+         closest_point_fn).
+      3. Linearizirano point-to-plane: majhna rotacija+translacija
+         [rot_x,rot_y,rot_z,t_x,t_y,t_z], ki minimizira utežen kvadrat
+         residuala (p-proj).normal, uteži = point_sigma_mm (1/sigma^2, glej
+         point_sigma_mm spodaj) x Tukey(robust_kernel_k) na residualu.
+      4. np.linalg.lstsq (NE np.linalg.solve): H = A^T W A je za nekatere
+         resnične površine TOČNO singularna (npr. neskončna ravna ploskev
+         ne omejuje x/y-translacije ali yaw sploh - noben del njihove
+         Jacobijeve komponente ne vpliva na residual) in za druge
+         SKORAJ-singularna (npr. pretežno ravna ploskev z majhno asimetrično
+         značilnostjo - ravno geometrija te robotske celice, glej
+         compute_pose_covariance docstring). lstsq vrne rešitev z najmanjšo
+         normo (brez popravka vzdolž neopazljivih smeri) namesto da bi
+         vrgel izjemo ali eksplodiral na slabo pogojenem sistemu - preverjeno
+         s sintetičnimi testi (ravna ploskev, delna krogla s heteroscedastičnim
+         šumom - glej samostojne teste ob koncu datoteke).
+
+    point_sigma_mm (neobvezno): std (mm) meritvene negotovosti VSAKE
+    scan_points točke (glej compute_scan_point_sigma_mm,
+    heteroscedastic_noise_std_mm) - uteži normalne enačbe z 1/sigma^2.
+    None (privzeto) = enaka teža za vse (samo robust_kernel_k, če podan).
+
+    max_correspondence_distance: korespondence z |p-proj| nad tem se
+    popolnoma izključijo (utež 0) - ker se ta funkcija kliče PO
+    refine_registration (že blizu prave rešitve), naj bo to majhno
+    (tipično manjše od zadnje ICP stopnje distance_threshold), da izloči
+    sken točke brez fizičnega ujemanja na CAD (rob okluzije, ostanek
+    mize/ozadja), ne pa pravih korespondenc.
+
+    Vrne dict: transformation (4x4, CAD->svet, ista konvencija kot povsod),
+    iterations (dejansko izvedene), weighted_rmse (utežen RMS point-to-plane
+    residual zadnje iteracije), n_correspondences (koliko sken točk je bilo
+    znotraj max_correspondence_distance v zadnji iteraciji)."""
+    if scan_points.shape[0] == 0:
+        raise ValueError("point_to_mesh_icp: scan_points is empty")
+
+    world_to_cad = np.linalg.inv(init_transformation)   # trenutna ocena, svet->CAD (obratno od klicateljeve source->target konvencije - glej refine_registration "ICP smer je OBRNJENA" za isto vzorec)
+    weights = (1.0 / np.maximum(point_sigma_mm, 1e-6) ** 2) if point_sigma_mm is not None else np.ones(len(scan_points))
+
+    weighted_rmse = float("nan")
+    n_used = 0
+    iterations_done = 0
+    for _ in range(max_iterations):
+        R = world_to_cad[:3, :3]
+        t = world_to_cad[:3, 3]
+        p_cad = (R @ scan_points.T).T + t   # sken v CAD okvir pod trenutno oceno
+
+        proj, normal = closest_point_fn(p_cad)
+        normal = normal / np.clip(np.linalg.norm(normal, axis=1, keepdims=True), 1e-12, None)
+
+        residual_vec = p_cad - proj
+        dist = np.linalg.norm(residual_vec, axis=1)
+        inlier = (dist <= max_correspondence_distance if np.isfinite(max_correspondence_distance)
+                 else np.ones(len(dist), dtype=bool))
+        if inlier.sum() < 6:   # premalo korespondenc za 6-DOF rešitev - varno prekinemo, vrnemo zadnjo veljavno oceno
+            break
+
+        r = np.sum(residual_vec * normal, axis=1)   # signiran point-to-plane residual
+
+        w = weights.copy()
+        if robust_kernel_k is not None and robust_kernel_k > 0:
+            # Tukey biweight - ista shema kot refine_registration-ov TukeyLoss(k=...)
+            u = np.clip(r / robust_kernel_k, -1.0, 1.0)
+            tukey = (1.0 - u ** 2) ** 2
+            tukey = np.where(np.abs(r) < robust_kernel_k, tukey, 0.0)
+            w = w * tukey
+        w = w * inlier   # korespondence nad max_correspondence_distance popolnoma izključene
+
+        cross = np.cross(p_cad, normal)   # d(residual)/d(rotation) linearizacijski člen
+        A = np.hstack([cross, normal])   # n x 6: [rot_x,rot_y,rot_z, t_x,t_y,t_z]
+        AtW = A.T * w   # 6 x n
+        H = AtW @ A   # 6x6 normalno-enačbena matrika
+        b = -AtW @ r   # 6
+
+        delta, _, _, _ = np.linalg.lstsq(H, b, rcond=None)   # glej docstring - lstsq namesto solve, H je lahko (skoraj) singularna
+
+        d_rot = delta[:3]
+        d_t = delta[3:]
+        angle = np.linalg.norm(d_rot)
+        R_delta = rotation_about_axis(d_rot / angle, np.degrees(angle)) if angle > 1e-12 else np.eye(3)
+        delta_transform = np.eye(4)
+        delta_transform[:3, :3] = R_delta
+        delta_transform[:3, 3] = d_t
+        world_to_cad = delta_transform @ world_to_cad   # sestavimo inkrementalni popravek (levo množenje - popravek je v trenutnem CAD-okvirju)
+
+        denom = max(float(np.sum(w[inlier])), 1e-12)
+        weighted_rmse = float(np.sqrt(np.sum(w[inlier] * r[inlier] ** 2) / denom))
+        n_used = int(inlier.sum())
+        iterations_done += 1
+
+        if angle < np.radians(convergence_rotation_tol_deg) and np.linalg.norm(d_t) < convergence_translation_tol_mm:
+            break
+
+    return {
+        "transformation": np.linalg.inv(world_to_cad),   # nazaj v CAD->svet konvencijo
+        "iterations": iterations_done,
+        "weighted_rmse": weighted_rmse,
+        "n_correspondences": n_used,
+    }
+
+
+def compute_scan_point_sigma_mm(scan_points: np.ndarray,
+                                camera_location: np.ndarray,
+                                incidence_cos: np.ndarray,
+                                depth_noise_at_1m: float,
+                                noise_distance_power: float,
+                                max_incidence_deg: float,
+                                noise_reference_distance_m: float) -> np.ndarray:
+    """Std (mm) meritvene negotovosti vsake scan_points točke, iz ISTEGA
+    heteroscedastičnega šumovnega modela, ki ga simulate_camera_scan
+    uporabi za generiranje šuma (heteroscedastic_noise_std_mm) - point_to_mesh_icp
+    ga uporabi kot 1/sigma^2 utež (glej point_sigma_mm tam), namesto da bi
+    vsako korespondenco obravnaval enako, dokler je Tukey ne izloči zgolj
+    na podlagi velikosti residuala."""
+    distance_m = np.linalg.norm(scan_points - camera_location, axis=1) / 1000.0
+    return heteroscedastic_noise_std_mm(distance_m, incidence_cos, depth_noise_at_1m,
+                                        noise_distance_power, max_incidence_deg,
+                                        noise_reference_distance_m)
 
 
 def transformation_error(estimated: np.ndarray, reference: np.ndarray) -> dict:
@@ -1519,6 +1944,52 @@ def evaluate_target_coverage(source: o3d.geometry.PointCloud,
     }
 
 
+def compute_pose_covariance(source: o3d.geometry.PointCloud,
+                            target: o3d.geometry.PointCloud,
+                            transformation: np.ndarray,
+                            threshold: float) -> Optional[dict]:
+    """6x6 kovarianca poze iz ICP-jeve lastne informacijske matrike pri
+    KONČNI pozi (Open3D-jev get_information_matrix_from_point_clouds - ista
+    linearizacija okoli korespondenc znotraj threshold, na kateri temelji
+    point-to-plane ICP sam), namesto ene same skalarne napake
+    (fitness/inlier_rmse/trimmed_rms).
+
+    ZAKAJ je to uporabno: pri ravni "sealing" ploskvi (ta cevovod) so
+    Z/roll/pitch trdno določeni (vsaka izmerjena točka jih omejuje), X/Y/yaw
+    pa so določeni SAMO prek redkih asimetričnih značilnosti (locator pini,
+    konektor - iste točke, ki jih identify_asymmetric_points najde). Ena
+    sama skupna napaka (npr. inlier_rmse) tega ne loči - dober rmse na
+    veliki ravni ploskvi lahko soobstaja s praktično neomejenim X/Y/yaw, če
+    je asimetrična značilnost majhna ali delno okludirana. Vrstni red DOF
+    ustreza Open3D-jevi lastni konvenciji: [rot_x, rot_y, rot_z, t_x, t_y,
+    t_z] (glej Open3D dokumentacijo get_information_matrix_from_point_clouds).
+
+    Vrne None, če je informacijska matrika singularna (premalo/degenerirane
+    korespondence) - to je SAMO diagnostika/dodaten izpis (glej
+    run_registration "Phase 6.5"), NE nov PASS/FAIL prag: privzeti pragovi v
+    decide_registration_outcome so že označeni kot nekalibrirani placeholderji
+    (glej njen docstring), dodajanje še enega nekalibriranega praga tukaj bi
+    samo dodalo še en neutemeljen način za tiho napačno zavrnitev/sprejem
+    poze. Namenjeno ROČNI/naknadni kalibraciji: če sigma_yaw_deg dosledno
+    izide velik na znano-dobrih pozah (--translation_x/y/z/--rotation_x/y/
+    z_deg Monte Carlo, glej decide_registration_outcome), je to signal, da
+    del/kamera postavitev ne daje dovolj asimetričnega signala za zanesljivo
+    yaw oceno - uporabno vedeti PREDEN se to prevede v kalibriran prag."""
+    info = o3d.pipelines.registration.get_information_matrix_from_point_clouds(
+        source, target, threshold, transformation)
+    try:
+        cov = np.linalg.inv(info)
+    except np.linalg.LinAlgError:
+        return None
+    diag = np.diag(cov)
+    if np.any(diag < 0):   # numerično degenerirana (skoraj singularna) informacijska matrika - kovarianca ni fizikalno smiselna
+        return None
+    return {
+        "sigma_rotation_deg": np.degrees(np.sqrt(diag[:3])).tolist(),   # [roll, pitch, yaw] priblizna std, glej opombo o DOF vrstnem redu zgoraj
+        "sigma_translation_mm": np.sqrt(diag[3:]).tolist(),   # [x, y, z] priblizna std (mm)
+    }
+
+
 def identify_asymmetric_points(pcd: o3d.geometry.PointCloud,
                                up_axis: int,
                                center: np.ndarray,
@@ -1572,28 +2043,52 @@ def identify_asymmetric_points_cached(pcd: o3d.geometry.PointCloud,
                                       center: np.ndarray,
                                       top_fraction: float,
                                       cache_key: Optional[str]) -> np.ndarray:
-    """Ovojnica okoli identify_asymmetric_points s preprostim in-memory
-    predpomnilnikom (velja za življenjsko dobo tega Python procesa, ne na
-    disk). Maska je odvisna SAMO od CAD geometrije (source, PRED
+    """Ovojnica okoli identify_asymmetric_points z dvoplastnim
+    predpomnilnikom: v-pomnilniku (_ASYMMETRIC_MASK_CACHE, velja za
+    življenjsko dobo tega Python procesa) IN na disku
+    (PREPROCESS_CACHE_DIR, velja med zagoni - glej preprocess_point_cloud,
+    ista mapa). Maska je odvisna SAMO od CAD geometrije (source, PRED
     kakršnokoli registracijsko transformacijo) - ne od poze, šuma ali
-    kamere - zato jo je nesmiselno na novo računati (2-5s) pri VSAKEM
-    klicu run_registration znotraj istega procesa, ko se isti CAD/crop
-    parametri ne spremenijo (npr. camera_benchmark.py pokliče
-    run_registration na stotine/tisoče-krat z istim CAD-om in top_fraction,
-    le drugo pozo/šum/kamero vsakič).
+    kamere - zato jo je nesmiselno na novo računati pri VSAKEM klicu
+    run_registration (npr. camera_benchmark.py pokliče run_registration na
+    stotine/tisoče-krat z istim CAD-om in top_fraction, le drugo pozo/šum/
+    kamero vsakič), IN nesmiselno vsak PRVI klic v vsakem novem procesu
+    (npr. vsak samostojen main_trial.py zagon).
+
+    Klicatelj naj to pokliče na source_down (zmanjšan CAD oblak, že
+    izračunan za yaw sweep/ICP), NE na polnem source (~70k+ točk) - maska
+    služi le izbiri razlikovalnih točk za verify_asymmetric_feature_alignment,
+    za kar polna ločljivost ni potrebna (glej run_registration Phase 5), in
+    compute_point_cloud_distance-ova N x N primerjava (identify_asymmetric_points
+    znotraj) je na source_down bistveno hitrejša za praktično enak rezultat.
 
     cache_key naj bo run_registration-ov lastni source_cache_key (že
-    izračunan za preprocess_point_cloud) + asymmetric_check_top_fraction -
-    ta dva skupaj enolično določata `source` in s tem tudi masko. Klicatelj
-    naj poda cache_key=None, kadar cache NI varen (npr. use_cad_cache=False
-    - sveže Poisson-disk vzorčenje ni deterministično med zagoni, glej
-    load_cad_model docstring, zato bi predpomnjena maska lahko ustrezala
-    DRUGAČNEMU dejanskemu oblaku točk kot trenutni `source`)."""
+    izračunan za preprocess_point_cloud, torej vključno z voxel_size, ker
+    source_down od njega odvisen) + asymmetric_check_top_fraction - ta dva
+    skupaj enolično določata `pcd` (source_down) in s tem tudi masko.
+    Klicatelj naj poda cache_key=None, kadar cache NI varen (npr.
+    use_cad_cache=False - sveže Poisson-disk vzorčenje ni deterministično
+    med zagoni, glej load_cad_model docstring, zato bi predpomnjena maska
+    lahko ustrezala DRUGAČNEMU dejanskemu oblaku točk kot trenutni `pcd`)."""
     if cache_key is not None and cache_key in _ASYMMETRIC_MASK_CACHE:
         return _ASYMMETRIC_MASK_CACHE[cache_key]
+
+    disk_path = None
+    if cache_key is not None:
+        digest = hashlib.md5(cache_key.encode()).hexdigest()[:16]   # kratek hash celotnega cache_key
+        PREPROCESS_CACHE_DIR.mkdir(exist_ok=True)
+        disk_path = PREPROCESS_CACHE_DIR / f"asymmask_{digest}.npy"
+        if disk_path.exists():
+            mask = np.load(disk_path)
+            if len(mask) == len(pcd.points):   # dolžinski preverba - dodatna varovalka poleg samega cache_key, poceni
+                _ASYMMETRIC_MASK_CACHE[cache_key] = mask
+                return mask
+
     mask = identify_asymmetric_points(pcd, up_axis, center, top_fraction=top_fraction)
     if cache_key is not None:
         _ASYMMETRIC_MASK_CACHE[cache_key] = mask
+        if disk_path is not None:
+            np.save(disk_path, mask)
     return mask
 
 
@@ -1734,13 +2229,19 @@ def run_registration(cad_path: Path,
                      top_fraction: float = 0.35,
                      up_axis: int = 2,
                      flip_up_direction: bool = False,
+                     crop_edge_margin_factor: float = 2.0,
                      coarse_distance_factor: float = 3.0,
                      yaw_step_deg: float = 6.0,
                      yaw_sweep_refine_iterations: int = 5,
                      icp_distance_factor: float = 2.0,
                      icp_voxel_scales: tuple[float, ...] = (4.0, 2.0, 1.0, 0.5),
                      icp_max_iterations: int = 100,
+                     icp_iterations_schedule: Optional[dict[float, int]] = None,
                      robust_kernel_k_factor: float = 1.0,
+                     use_mesh_polish: bool = True,
+                     mesh_polish_max_iterations: int = 30,
+                     mesh_polish_distance_factor: float = 1.0,
+                     mesh_polish_trim_fraction: float = 0.8,
                      min_coarse_fitness_for_icp: float = 0.1,
                      use_cad_cache: bool = True,
                      use_preprocess_cache: bool = True,
@@ -1785,7 +2286,8 @@ def run_registration(cad_path: Path,
     source = load_cad_model(cad_path, sample_point_count, use_cache=use_cad_cache)   # naložimo CAD kot oblak točk
     full_part_height = float(source.get_max_bound()[up_axis] - source.get_min_bound()[up_axis])   # znana polna višina CELEGA dela, PRED obrezovanjem - potrebna za remove_table_background
     source = crop_top_region(source, top_fraction=top_fraction, up_axis=up_axis,
-                             flip_up_direction=flip_up_direction)   # obrežemo na zgornje "sealing" območje
+                             flip_up_direction=flip_up_direction,
+                             edge_margin=voxel_size * crop_edge_margin_factor)   # obrežemo na zgornje "sealing" območje, minus umeten rob (glej crop_top_region docstring) - samo na CAD/source strani
     cropped_region_height = float(source.get_max_bound()[up_axis] - source.get_min_bound()[up_axis])   # dejanska (izmerjena, ne le top_fraction*full_part_height) višina te regije - za remove_table_background, da zoži pas tudi od spodaj
     print(f"  Cropped CAD model to top {top_fraction:.0%} along axis {up_axis} "
           f"(flip_up_direction={flip_up_direction}) "
@@ -1797,8 +2299,20 @@ def run_registration(cad_path: Path,
     # enako kot target.
     source_camera_location = top_camera_location(source, up_axis=up_axis,
                                                   flip_up_direction=flip_up_direction)   # virtualna kamera za orientacijo normal source-a
+    # Naložena TUKAJ (ne le znotraj spodnje simulacijske veje kot prej) -
+    # branje STL-ja je hitro (glej load_cad_mesh docstring), potrebuje pa jo
+    # zdaj tudi Phase 4.5 (point_to_mesh_icp polish) NE GLEDE NA use_real_scan,
+    # ne le simulate_camera_scan spodaj.
+    cad_mesh = load_cad_mesh(cad_path)   # naložimo CAD kot NEobrezano, NEtransformirano mrežo (za ray casting IN/ali mesh-polish)
 
     print("Phase 2: Loading target scan...")
+    # target_grid_points/target_hit_mask: organizirana (H,W) mreža, na voljo
+    # SAMO za simulirano ray-casting vejo spodaj (glej simulate_camera_scan
+    # docstring) - filter_grazing_incidence_points_from_grid jo uporabi za
+    # O(n) (ne KD-tree) filtriranje. Pravi sken (naložen iz datoteke) te
+    # strukture nima (samo sploščen oblak), zato ostane None -> spodnji
+    # filter pade nazaj na počasnejšo, a splošno filter_grazing_incidence_points.
+    target_grid_points, target_hit_mask = None, None
     if use_real_scan and scan_path is not None and scan_path.exists():
         all_scan_paths = [scan_path] + list(extra_scan_paths or [])   # primarni sken + morebitni dodatni zaporedni zajemi za temporalno povprečenje
         if len(all_scan_paths) > 1:
@@ -1808,8 +2322,7 @@ def run_registration(cad_path: Path,
         if filter_real_scan:
             target = filter_scan(target)   # odstranimo statistične osamelce
     else:
-        cad_mesh = load_cad_mesh(cad_path)   # naložimo CAD kot mrežo (za ray casting)
-        target = simulate_camera_scan(cad_mesh, disable_occlusion=disable_occlusion,
+        target, target_grid_points, target_hit_mask = simulate_camera_scan(cad_mesh, disable_occlusion=disable_occlusion,
                                       up_axis=up_axis, flip_up_direction=flip_up_direction,
                                       top_fraction=top_fraction,
                                       camera_location=np.zeros(3),
@@ -1837,10 +2350,28 @@ def run_registration(cad_path: Path,
 
     if remove_table_background_flag:
         print("  Removing table/background points from target...")
-        target = remove_table_background(target, up_axis=up_axis, flip_up_direction=flip_up_direction,
-                                         part_height_mm=full_part_height,
-                                         cropped_region_height_mm=cropped_region_height,
-                                         margin_mm=table_removal_margin_mm)   # odstranimo domnevne mizne/ozadje točke IN zavese pod skenirano regijo
+        n_before_table_removal = len(target.points)
+        target, table_removal_keep_mask = remove_table_background(
+            target, up_axis=up_axis, flip_up_direction=flip_up_direction,
+            part_height_mm=full_part_height,
+            cropped_region_height_mm=cropped_region_height,
+            margin_mm=table_removal_margin_mm)   # odstranimo domnevne mizne/ozadje točke IN zavese pod skenirano regijo
+        if target_hit_mask is not None and n_before_table_removal == int(target_hit_mask.sum()):
+            # Uskladi organizirano mrežo s post-removal target-om (glej
+            # remove_table_background-ov keep_mask docstring) - table_removal_keep_mask
+            # je poravnan ena-na-ena s prejšnjim (pred-odstranitvenim)
+            # target-om, ki je natanko target_hit_mask.reshape(-1)[hit indeksi]
+            # v istem vrstnem redu (oba izvirata iz istega flatten reda
+            # simulate_camera_scan-ovega hit_points[hit_mask]). Dolžinski
+            # preverba (n_before_table_removal == hit_mask.sum()) je
+            # varovalka - če se kdaj ne ujema, raje obdržimo staro
+            # target_hit_mask nedotaknjeno in prepustimo spodnjemu
+            # (počasnejšemu, a vedno pravilnemu) KD-tree filtru.
+            hit_flat = target_hit_mask.reshape(-1)
+            hit_indices = np.where(hit_flat)[0]
+            new_hit_flat = hit_flat.copy()
+            new_hit_flat[hit_indices[~table_removal_keep_mask]] = False
+            target_hit_mask = new_hit_flat.reshape(target_hit_mask.shape)
 
     # source (CAD) in target (sken) prikazana v svojih izvornih/svetovnih
     # koordinatah, brez uporabljene transformacije - njuna relativna
@@ -1863,10 +2394,21 @@ def run_registration(cad_path: Path,
 
     if filter_grazing_incidence:
         print("  Filtering grazing-incidence (flying pixel) points from target...")
-        target = filter_grazing_incidence_points(
-            target, target_camera_location,
-            max_incidence_deg=flying_pixel_filter_max_incidence_deg,
-            normal_radius=voxel_size * grazing_incidence_normal_radius_factor)   # odstranimo domnevne leteče piksle na robovih pred predobdelavo
+        if target_hit_mask is not None:
+            # Hiter, O(n) pot (glej filter_grazing_incidence_points_from_grid) -
+            # na voljo, ko imamo organizirano mrežo (simulirana ray-casting
+            # veja, glej target_grid_points/target_hit_mask zgoraj), ki je
+            # vzdrževana usklajena s `target`-om skozi vsak vmesni korak, ki
+            # bi sicer spremenil njegovo množico točk (remove_table_background
+            # zgoraj propagira svoj keep_mask nazaj vanjo - glej ta klic).
+            target = filter_grazing_incidence_points_from_grid(
+                target_grid_points, target_hit_mask, target_camera_location,
+                max_incidence_deg=flying_pixel_filter_max_incidence_deg)
+        else:
+            target = filter_grazing_incidence_points(
+                target, target_camera_location,
+                max_incidence_deg=flying_pixel_filter_max_incidence_deg,
+                normal_radius=voxel_size * grazing_incidence_normal_radius_factor)   # odstranimo domnevne leteče piksle na robovih pred predobdelavo
 
     print("Phase 3: Preprocessing point clouds...")
     # Cache ključi identificirajo *vhod* (vse zgoraj, kar določa source/
@@ -1874,7 +2416,7 @@ def run_registration(cad_path: Path,
     # preprocess_point_cloud sam vključi vsak parameter, ki dodatno vpliva
     # na njegov izhod.
     source_cache_key = (f"source_{cad_path.stem}_{sample_point_count}pts_top{top_fraction}_"
-                       f"axis{up_axis}_flip{flip_up_direction}")   # cache ključ za source
+                       f"axis{up_axis}_flip{flip_up_direction}_edgemargin{crop_edge_margin_factor}")   # cache ključ za source
     # remove_table_background_flag in filter_grazing_incidence oba
     # spremenita target (odstranita točke) PRED tem, ko
     # preprocess_point_cloud sploh vidi svoj cache_key, zato morata biti
@@ -1925,10 +2467,11 @@ def run_registration(cad_path: Path,
     # target = enostranski pogled kamere (pravi ali simuliran)
     source_down = preprocess_point_cloud(
         source, voxel_size, is_partial_view=True, camera_location=source_camera_location,
-        cache_key=source_cache_key, use_cache=use_preprocess_cache)   # zmanjšan in normaliziran source
+        cache_key=source_cache_key, use_cache=use_preprocess_cache,
+        preserve_existing_normals=True)   # zmanjšan source, z ohranjenimi TOČNIMI CAD (mesh) normalami - glej ensure_oriented_normals
     target_down = preprocess_point_cloud(
         target, voxel_size, is_partial_view=True, camera_location=target_camera_location,
-        cache_key=target_cache_key, use_cache=use_preprocess_cache)   # zmanjšan in normaliziran target
+        cache_key=target_cache_key, use_cache=use_preprocess_cache)   # zmanjšan in normaliziran target (normale OCENJENE - sken jih nima vnaprej)
 
     print("Phase 4: Global registration (yaw sweep)...")
     # Izkorišča pravo omejitev postavitve (stik z mizo fiksira Z/roll/
@@ -1988,9 +2531,84 @@ def run_registration(cad_path: Path,
                                          source_camera_location=source_camera_location,
                                          target_camera_location=target_camera_location,
                                          icp_max_iterations=icp_max_iterations,
+                                         icp_iterations_schedule=icp_iterations_schedule,
                                          robust_kernel_k_factor=robust_kernel_k_factor)   # natančna, večnivojska ICP refinacija
         print(f"  ICP fitness: {icp_result.fitness:.4f}, "
               f"inlier_rmse: {icp_result.inlier_rmse:.4f}")
+
+        if use_mesh_polish:
+            print("Phase 4.5: Point-to-mesh polish (exact CAD surface, heteroscedastic-weighted)...")
+            # Zadnji, KONČNI natančnostni korak nad refine_registration:
+            # poravna sken neposredno na točno CAD mrežo (RaycastingScene),
+            # ne na Poisson-disk vzorčen CAD oblak - glej modulski komentar
+            # nad build_cad_raycasting_scene za razlog (diskretizacijska
+            # talna meja vzorčenega oblaka). Uteži vsako sken točko z
+            # 1/sigma^2 iz istega heteroscedastičnega šumovnega modela, ki
+            # ga simulate_camera_scan uporabi za generiranje šuma - glej
+            # point_to_mesh_icp/compute_scan_point_sigma_mm docstring.
+            #
+            # Strogo NE-regresivno: sprejme polish rezultat SAMO, če je
+            # njegov trimmed_rms (ista threshold-free metrika kot
+            # refine_registration-ova izbira kandidatov, glej
+            # trimmed_rms_target_to_source) enak ali boljši od rezultata
+            # pred polish-em - ker tega koraka ni bilo mogoče empirično
+            # validirati na resničnem CAD/sken paru znotraj tega popravka
+            # (samo na sintetičnih testih, glej modulske self-teste), je ta
+            # varovalka namenoma konservativna: v najslabšem primeru je
+            # brez učinka (obdrži pred-polish transformacijo), nikoli ne
+            # more rezultat POSLABŠATI.
+            scene = build_cad_raycasting_scene(cad_mesh)
+            target_points_full = np.asarray(target.points)
+            pre_polish_transform = icp_result.transformation
+            pre_polish_trimmed_rms = trimmed_rms_target_to_source(
+                source, target, pre_polish_transform, mesh_polish_trim_fraction)
+
+            # Enkratna korespondenčna poizvedba pri pred-polish pozi, samo za
+            # oceno kota vpadanja vsake sken točke (za heteroscedastic utež)
+            # - ne posodobljena skozi iteracije spodaj (glej
+            # compute_scan_point_sigma_mm docstring), ker gre za lastnost
+            # SENZORSKE geometrije ob zajemu, ne nekaj, kar bi se moralo
+            # spreminjati z ICP-jevo trenutno oceno poze.
+            world_to_cad_init = np.linalg.inv(pre_polish_transform)
+            p_cad_init = (world_to_cad_init[:3, :3] @ target_points_full.T).T + world_to_cad_init[:3, 3]
+            _proj_init, normal_init_cad = raycasting_closest_point_fn(scene)(p_cad_init)
+            normal_init_cad = normal_init_cad / np.clip(
+                np.linalg.norm(normal_init_cad, axis=1, keepdims=True), 1e-12, None)
+            normal_init_world = (pre_polish_transform[:3, :3] @ normal_init_cad.T).T
+            view_dir = target_camera_location - target_points_full
+            view_dir /= np.clip(np.linalg.norm(view_dir, axis=1, keepdims=True), 1e-12, None)
+            incidence_cos = np.clip(np.abs(np.sum(view_dir * normal_init_world, axis=1)), 1e-3, 1.0)
+            sigma_mm = compute_scan_point_sigma_mm(
+                target_points_full, target_camera_location, incidence_cos,
+                depth_noise_at_1m, noise_distance_power, max_incidence_deg, noise_reference_distance_m)
+
+            finest_stage_voxel = voxel_size * min(icp_voxel_scales)   # ista skala kot refine_registration-ova zadnja (najfinejša) stopnja
+            polish_max_corr = finest_stage_voxel * icp_distance_factor * mesh_polish_distance_factor
+            polish_robust_k = finest_stage_voxel * robust_kernel_k_factor
+            polish = point_to_mesh_icp(
+                target_points_full, raycasting_closest_point_fn(scene), pre_polish_transform,
+                max_iterations=mesh_polish_max_iterations, max_correspondence_distance=polish_max_corr,
+                robust_kernel_k=polish_robust_k, point_sigma_mm=sigma_mm)
+            post_polish_trimmed_rms = trimmed_rms_target_to_source(
+                source, target, polish["transformation"], mesh_polish_trim_fraction)
+            print(f"  Point-to-mesh polish: {polish['iterations']} iterations, "
+                  f"weighted_rmse={polish['weighted_rmse']:.4f}, "
+                  f"n_correspondences={polish['n_correspondences']}/{len(target_points_full)}, "
+                  f"trimmed_rms {pre_polish_trimmed_rms:.4f} -> {post_polish_trimmed_rms:.4f}")
+
+            if post_polish_trimmed_rms <= pre_polish_trimmed_rms:
+                common_threshold_for_eval = voxel_size * 1.5   # isto merilo kot refine_registration-ov common_eval_threshold_factor privzetek
+                polish_eval = evaluate_registration(source, target, polish["transformation"], common_threshold_for_eval)
+                icp_result = o3d.pipelines.registration.RegistrationResult()
+                icp_result.transformation = polish["transformation"]
+                icp_result.fitness = polish_eval.fitness
+                icp_result.inlier_rmse = polish_eval.inlier_rmse
+                print(f"  Accepted mesh polish (trimmed_rms improved or unchanged): "
+                      f"fitness={icp_result.fitness:.4f}, inlier_rmse={icp_result.inlier_rmse:.4f}")
+            else:
+                print(f"  REJECTED mesh polish (trimmed_rms got worse: "
+                      f"{pre_polish_trimmed_rms:.4f} -> {post_polish_trimmed_rms:.4f}) - "
+                      f"keeping the pre-polish transformation")
 
     draw_registration_result(source, target, icp_result.transformation, "ICP Result")   # vizualiziramo končni rezultat
     print("Final transformation matrix:")
@@ -2020,14 +2638,19 @@ def run_registration(cad_path: Path,
     # verify_asymmetric_feature_alignment nato preveri SPECIFIČNO residual
     # teh točk pod končno transformacijo, veliko bolj ciljana varovalka kot
     # agregatne metrike zgoraj.
-    asymmetric_cache_key = (f"{source_cache_key}_asymtop{asymmetric_check_top_fraction}"
+    # source_down (ne polni source, ~70k+ točk) - glej
+    # identify_asymmetric_points_cached docstring za razlog (2-5s ->
+    # bistveno manj na ~5k točk, praktično enak rezultat, ker gre maski le
+    # za izbiro razlikovalnih točk). voxel_size mora biti del ključa, ker
+    # source_down (za razliko od polnega source) od njega odvisen.
+    asymmetric_cache_key = (f"{source_cache_key}_v{voxel_size}_down_asymtop{asymmetric_check_top_fraction}"
                            if use_cad_cache else None)   # glej identify_asymmetric_points_cached - None onemogoči cache, če CAD vzorčenje ni deterministično
     asymmetric_mask = identify_asymmetric_points_cached(
-        source, up_axis, source.get_center(), top_fraction=asymmetric_check_top_fraction,
-        cache_key=asymmetric_cache_key)   # katere source točke so razlikovalne/asimetrične
+        source_down, up_axis, source_down.get_center(), top_fraction=asymmetric_check_top_fraction,
+        cache_key=asymmetric_cache_key)   # katere source_down točke so razlikovalne/asimetrične
     residual_threshold = voxel_size * asymmetric_check_residual_factor   # prag "dobrega ujemanja" za te točke
     asym_stats = verify_asymmetric_feature_alignment(
-        source, target, icp_result.transformation, asymmetric_mask, residual_threshold)   # dejanski residual po ICP
+        source_down, target, icp_result.transformation, asymmetric_mask, residual_threshold)   # dejanski residual po ICP
     print(f"  {asym_stats['n_points']} asymmetric/distinctive points identified "
           f"(top {asymmetric_check_top_fraction:.0%} by self-rotation distance): "
           f"mean_residual={asym_stats['mean']:.3f}, median_residual={asym_stats['median']:.3f}, "
@@ -2045,6 +2668,24 @@ def run_registration(cad_path: Path,
           f"mean_dist={target_coverage['mean']:.3f}, median_dist={target_coverage['median']:.3f}, "
           f"fraction_within_{coverage_threshold:.2f}mm={target_coverage['fraction_within_threshold']:.2%}")
 
+    print("Phase 6.5: Pose covariance (which DOF is actually well-constrained)...")
+    # Diagnostika, ne PASS/FAIL prag - glej compute_pose_covariance docstring.
+    # Uporabi source_down/target_down (ne polna ločljivost) - gre za
+    # diagnostičen izpis, ne za samo končno poročano metriko, glej isto
+    # logiko kot 2.6/refine_registration-ov eval-resolution.
+    pose_covariance = compute_pose_covariance(source_down, target_down, icp_result.transformation, coverage_threshold)
+    if pose_covariance is not None:
+        sr = pose_covariance["sigma_rotation_deg"]
+        st = pose_covariance["sigma_translation_mm"]
+        print(f"  sigma_rotation_deg (roll,pitch,yaw)=({sr[0]:.3f}, {sr[1]:.3f}, {sr[2]:.3f}), "
+              f"sigma_translation_mm (x,y,z)=({st[0]:.3f}, {st[1]:.3f}, {st[2]:.3f}) - "
+              f"large values mark a DOF the scanned geometry doesn't actually constrain well "
+              f"(e.g. yaw/x/y on a mostly-flat sealing surface with only a small asymmetric "
+              f"feature), independent of how good the aggregate fitness/rmse look")
+    else:
+        print("  Could not compute pose covariance (singular/degenerate information matrix) - "
+              "skipping this diagnostic")
+
     print("Phase 7: PASS/FAIL accept decision...")
     # Nadomesti prejšnji asimetrični par varovalk (WARNING izpis tukaj +
     # tiho vrnjena, morda slaba transformacija na prešibki coarse fitness
@@ -2061,6 +2702,7 @@ def run_registration(cad_path: Path,
         max_inlier_rmse=max_accept_inlier_rmse,
         min_asymmetric_fraction=min_accept_asymmetric_fraction,
         min_target_coverage=min_accept_target_coverage)
+    decision["pose_covariance"] = pose_covariance   # diagnostika, NE del PASS/FAIL odločitve zgoraj - glej compute_pose_covariance docstring
     if decision["accepted"]:
         print(f"  ACCEPT: fitness={decision['fitness']:.4f}, inlier_rmse={decision['inlier_rmse']:.4f}, "
               f"asymmetric_fraction={decision['asymmetric_fraction']:.2%}, "
@@ -2207,6 +2849,87 @@ def _test_build_reference_transform() -> None:
     print("  OK: build_reference_transform pravilno sestavi rotacijo in translacijo")
 
 
+def _test_point_to_mesh_icp_plane() -> None:
+    """point_to_mesh_icp na neskončni ravni ploskvi (z=0 v CAD okvirju,
+    analitičen closest_point_fn - brez potrebe po pravi RaycastingScene) -
+    x/y-translacija in yaw so na taki ploskvi FIZIKALNO neopazljivi (noben
+    del njihove Jacobijeve komponente ne vpliva na residual), zato H
+    (normalno-enačbena matrika) izide TOČNO singularna. Preveri, da funkcija
+    na tem ne obstane/vrže izjeme (glej docstring - np.linalg.lstsq namesto
+    np.linalg.solve) in da vseeno v celoti zapre edini opazljiv residual
+    (višina nad ravnino)."""
+    def plane_closest_point_fn(p_cad: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        proj = p_cad.copy()
+        proj[:, 2] = 0.0
+        normal = np.tile(np.array([0.0, 0.0, 1.0]), (p_cad.shape[0], 1))
+        return proj, normal
+
+    rng = np.random.RandomState(0)
+    n_pts = 300
+    cad_pts = np.zeros((n_pts, 3))
+    cad_pts[:, 0] = rng.uniform(-50, 50, n_pts)
+    cad_pts[:, 1] = rng.uniform(-50, 50, n_pts)
+
+    t_true = build_reference_transform(120.0, -30.0, 400.0, 4.0, -6.0, 25.0)
+    scan_pts_world = (t_true[:3, :3] @ cad_pts.T).T + t_true[:3, 3]
+    t_init = build_reference_transform(115.0, -35.0, 395.0, 2.0, -3.0, 20.0)
+
+    result = point_to_mesh_icp(scan_pts_world, plane_closest_point_fn, t_init, max_iterations=50)
+    assert result["iterations"] > 0, (
+        "should not stall on a singular (flat-plane) Hessian - see np.linalg.lstsq in docstring")
+    world_to_cad = np.linalg.inv(result["transformation"])
+    p_cad_final = (world_to_cad[:3, :3] @ scan_pts_world.T).T + world_to_cad[:3, 3]
+    plane_residual_rms = float(np.sqrt(np.mean(p_cad_final[:, 2] ** 2)))
+    assert plane_residual_rms < 1e-6, (
+        f"should fully close the only observable residual (height above the plane), "
+        f"got {plane_residual_rms}")
+    print("  OK: point_to_mesh_icp closes the observable residual on a singular-Hessian flat plane")
+
+
+def _test_point_to_mesh_icp_weighted() -> None:
+    """point_to_mesh_icp na delno vidni krogli (analitičen closest_point_fn)
+    z UMETNO heteroscedastičnim šumom (15% točk 100x širši std) - preveri,
+    da point_sigma_mm uteženje dejansko izboljša natančnost proti
+    neuteženemu klicu na ISTIH zašumljenih podatkih (ne le da se koda ne
+    sesuje)."""
+    radius = 200.0
+
+    def sphere_closest_point_fn(p_cad: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        norm = np.linalg.norm(p_cad, axis=1, keepdims=True)
+        normal = p_cad / np.clip(norm, 1e-9, None)
+        return normal * radius, normal
+
+    rng = np.random.RandomState(1)
+    n_pts = 400
+    phi = rng.uniform(0, 2 * np.pi, n_pts)
+    costheta = rng.uniform(0.3, 0.9, n_pts)   # delen pogled, ne cela krogla
+    theta = np.arccos(costheta)
+    cad_pts = np.stack([
+        radius * np.sin(theta) * np.cos(phi),
+        radius * np.sin(theta) * np.sin(phi),
+        radius * np.cos(theta),
+    ], axis=1)
+
+    t_true = build_reference_transform(50.0, 10.0, -300.0, 8.0, 3.0, -12.0)
+    scan_pts_clean = (t_true[:3, :3] @ cad_pts.T).T + t_true[:3, 3]
+    sigma = rng.choice([0.05, 5.0], size=n_pts, p=[0.85, 0.15])   # 15% "slabih" točk, 100x večja varianca
+    noisy_scan = scan_pts_clean + rng.normal(size=scan_pts_clean.shape) * sigma[:, None]
+    t_init = build_reference_transform(45.0, 15.0, -290.0, 5.0, 6.0, -8.0)
+
+    result_weighted = point_to_mesh_icp(noisy_scan, sphere_closest_point_fn, t_init,
+                                        max_iterations=50, robust_kernel_k=1.0, point_sigma_mm=sigma)
+    result_unweighted = point_to_mesh_icp(noisy_scan, sphere_closest_point_fn, t_init, max_iterations=50)
+
+    err_weighted = float(np.linalg.norm(result_weighted["transformation"][:3, 3] - t_true[:3, 3]))
+    err_unweighted = float(np.linalg.norm(result_unweighted["transformation"][:3, 3] - t_true[:3, 3]))
+    assert err_weighted < err_unweighted, (
+        f"heteroscedastic point_sigma_mm weighting should beat unweighted on the same noisy "
+        f"input, got weighted={err_weighted:.4f}mm >= unweighted={err_unweighted:.4f}mm")
+    assert err_weighted < 1.0, f"weighted fit should land close to the true pose, got {err_weighted:.4f}mm"
+    print(f"  OK: point_to_mesh_icp point_sigma_mm weighting reduces translation error "
+          f"({err_weighted:.4f}mm weighted vs {err_unweighted:.4f}mm unweighted)")
+
+
 def run_self_tests() -> None:
     """Pognati vse hitre, samostojne teste novih parametrov za kalibracijo
     na resnične kamere (glej modulski komentar zgoraj in kamere.py)."""
@@ -2216,6 +2939,8 @@ def run_self_tests() -> None:
     _test_global_planarity_bias()
     _test_top_camera_location_offset_distance()
     _test_build_reference_transform()
+    _test_point_to_mesh_icp_plane()
+    _test_point_to_mesh_icp_weighted()
     print("All self-tests passed.")
 
 
@@ -2405,6 +3130,16 @@ def parse_args() -> argparse.Namespace:
                              "placed on the table - if the cropped/scanned face turns out to "
                              "be the one that ends up against the table instead of facing the "
                              "camera, this is the flag to flip, not --top_fraction")
+    parser.add_argument("--crop_edge_margin_factor", type=float, default=2.0,
+                        help="Exclude a band this many multiples of --voxel_size wide from the "
+                             "CAD source, right next to --top_fraction's cut boundary (see "
+                             "crop_top_region's edge_margin). That boundary is artificial (the "
+                             "part/mesh really continues past it, this crop just cuts it off) - "
+                             "the real scan may or may not see material just past it depending "
+                             "on occlusion, while the CAD side always ends exactly there, which "
+                             "otherwise pulls ICP systematically. Only applied to the CAD side "
+                             "being matched against, never to the mesh the simulated scan itself "
+                             "is generated from. 0 disables it (old behavior)")
     parser.add_argument("--coarse_distance_factor", type=float, default=3.0,
                         help="Yaw sweep's max_correspondence_distance as a multiple of "
                              "voxel_size. Raise this (e.g. to 4-5) for noisier scans so "
@@ -2470,6 +3205,15 @@ def parse_args() -> argparse.Namespace:
                              "especially at the finer voxel scales - each stage runs "
                              "independently up to this budget or until Open3D's relative "
                              "fitness/rmse convergence tolerance is hit, whichever comes first")
+    parser.add_argument("--icp_iterations_schedule", type=str, default=None,
+                        help="Optional per-stage override of --icp_max_iterations, as "
+                             "'scale:iterations,scale:iterations,...' where each scale must "
+                             "match one of the values in --icp_voxel_scales (e.g. "
+                             "'4.0:30,2.0:50,1.0:75,0.5:100' to spend fewer iterations on the "
+                             "coarsest stage - the yaw sweep has usually already gotten close "
+                             "at that scale - and more on the finest one). A scale not listed "
+                             "here falls back to --icp_max_iterations. Unset (default): every "
+                             "stage uses --icp_max_iterations, identical to previous behavior")
     parser.add_argument("--robust_kernel_k_factor", type=float, default=1.0,
                         help="Scale (as a multiple of each ICP stage's own voxel size) of the "
                              "Tukey robust kernel (TukeyLoss) used in the point-to-plane ICP "
@@ -2482,6 +3226,32 @@ def parse_args() -> argparse.Namespace:
                              "Lower this (e.g. 0.5) for noisier scans to reject outliers harder, "
                              "raise it if a clean scan's legitimate near-edge points are being "
                              "excessively downweighted")
+    parser.add_argument("--no_mesh_polish", dest="use_mesh_polish", action="store_false", default=True,
+                        help="Disable the point-to-mesh polish stage (Phase 4.5) that runs after "
+                             "refine_registration, on by default. Poisson-disk sampling the CAD "
+                             "(--sample_points) puts a hard discretization floor (~voxel spacing) "
+                             "under how tight any point-cloud ICP can converge, no matter how many "
+                             "iterations - this stage instead aligns the scan directly against the "
+                             "exact CAD mesh triangles (RaycastingScene.compute_closest_points), "
+                             "weighting each scan point by its own heteroscedastic measurement "
+                             "sigma (see kamere.py's noise model) instead of trusting every "
+                             "correspondence equally. Strictly non-regressive: only accepted if it "
+                             "doesn't increase the trimmed target->CAD RMS distance versus the "
+                             "pre-polish pose (see trimmed_rms_target_to_source), so at worst it's "
+                             "a no-op, never a regression")
+    parser.add_argument("--mesh_polish_max_iterations", type=int, default=30,
+                        help="Max iterations for the point-to-mesh polish stage, see --no_mesh_polish")
+    parser.add_argument("--mesh_polish_distance_factor", type=float, default=1.0,
+                        help="Point-to-mesh polish's max correspondence distance, as a multiple of "
+                             "(voxel_size * finest --icp_voxel_scales entry * --icp_distance_factor) "
+                             "- i.e. relative to refine_registration's own finest stage, since this "
+                             "runs right after it and should only be excluding genuinely "
+                             "unmatched points (occlusion edges, background residue), not "
+                             "legitimate correspondences")
+    parser.add_argument("--mesh_polish_trim_fraction", type=float, default=0.8,
+                        help="Fraction of target points kept (closest first) when comparing the "
+                             "pre/post mesh-polish trimmed RMS to decide whether to accept the "
+                             "polish result - see trimmed_rms_target_to_source")
     parser.add_argument("--min_coarse_fitness_for_icp", type=float, default=0.1,
                         help="Skip ICP entirely if the coarse (yaw sweep) fitness is below "
                              "this. ICP's linearized solver can diverge to nonsense (meter/"
@@ -2695,6 +3465,13 @@ def main() -> None:
     print(f"Reference (ground-truth) transform - part pose relative to the camera "
           f"(fixed at the origin):\n{SIMULATED_TRANSFORM}\n")
 
+    icp_iterations_schedule = None   # glej --icp_iterations_schedule help
+    if args.icp_iterations_schedule:
+        icp_iterations_schedule = {}
+        for entry in args.icp_iterations_schedule.split(","):
+            scale_str, iterations_str = entry.split(":")
+            icp_iterations_schedule[float(scale_str)] = int(iterations_str)
+
     _source, _target, _coarse_result, _icp_result, decision = run_registration(
         cad_path=cad_path,
         scan_path=real_scan_path,
@@ -2722,13 +3499,19 @@ def main() -> None:
         top_fraction=args.top_fraction,
         up_axis=args.up_axis,
         flip_up_direction=args.flip_up_direction,
+        crop_edge_margin_factor=args.crop_edge_margin_factor,
         coarse_distance_factor=args.coarse_distance_factor,
         yaw_step_deg=args.yaw_step_deg,
         yaw_sweep_refine_iterations=args.yaw_sweep_refine_iterations,
         icp_distance_factor=args.icp_distance_factor,
         icp_voxel_scales=tuple(float(s) for s in args.icp_voxel_scales.split(",")),
         icp_max_iterations=args.icp_max_iterations,
+        icp_iterations_schedule=icp_iterations_schedule,
         robust_kernel_k_factor=args.robust_kernel_k_factor,
+        use_mesh_polish=args.use_mesh_polish,
+        mesh_polish_max_iterations=args.mesh_polish_max_iterations,
+        mesh_polish_distance_factor=args.mesh_polish_distance_factor,
+        mesh_polish_trim_fraction=args.mesh_polish_trim_fraction,
         min_coarse_fitness_for_icp=args.min_coarse_fitness_for_icp,
         use_cad_cache=args.use_cad_cache,
         use_preprocess_cache=args.use_preprocess_cache,

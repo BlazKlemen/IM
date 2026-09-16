@@ -44,7 +44,7 @@ def moveRobot(conn, transform_matrix, product_type, cycle_stop_event):
     dx, dy, dz, rx, ry, rz = matrix_to_epson(transform_matrix)
     print(f"[Robot] Pošiljam Local 1 odmike na robot: X={dx:.2f}, Y={dy:.2f}, Z={dz:.2f}...")
     
-    ukaz = f"1 {product_type} {dx:.3f} {dy:.3f} {dz:.3f} {rx:.3f} {ry:.3f} {rz:.3f}\n"
+    ukaz = f"1 {product_type} {dx:.3f} {dy:.3f} {dz:.3f} {rx:.3f} {ry:.3f} {rz:.3f}\r\n"
     
     try:
         conn.sendall(ukaz.encode('utf-8'))
@@ -139,10 +139,10 @@ def main():
     
     # Testna kalibracijska matrika
     TRAN_MATRIX = np.array([
-        [1.0, 0, 0.0, 5.0],
-        [0.0, 1.0, 0.0, 5.0],
-        [0.0, 0.0, 1.0, 5.0],
-        [0.0, 0.0, 0.0, 5.0]
+        [1.0, 0, 0.0, 0],
+        [0.0, 1.0, 0.0, 0],
+        [0.0, 0.0, 1.0, 0],
+        [0.0, 0.0, 0.0, 0]
     ])
     
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -162,7 +162,7 @@ def main():
         server_socket.close()
         return
 
-    #
+    # Smo izklopili vision watchdoga za testiranje 
     #print("[Kamera] Povezujem kamero...")
     #cap = cv2.VideoCapture(0)
     ##if not cap.isOpened():
@@ -198,12 +198,12 @@ def main():
                 
                 # Zaženemo niti in obema predamo cycle_stop_event
                 mainThread = threading.Thread(target=moveRobot, args=(global_conn, TRAN_MATRIX, product_type, cycle_stop_event))
-                movementThread = threading.Thread(target=checkMovement, args=(cap, frame, cycle_stop_event))
+                #movementThread = threading.Thread(target=checkMovement, args=(cap, frame, cycle_stop_event))
                 
-                movementThread.start()
+                #movementThread.start()
                 mainThread.start()
                 
-                movementThread.join()
+                #movementThread.join()
                 mainThread.join()
                 
                 print("[Main] Cikel zaključen. Delavec lahko varno odstrani kos.")

@@ -950,6 +950,57 @@ def compute_native_reference_point(mesh: o3d.geometry.TriangleMesh,
                               flip_up_direction=flip_up_direction)   # ista "sealing" regija, ki jo simulate_camera_scan dejansko zajame
     return np.asarray(cropped.get_center())   # geometrijsko središče te regije v CAD-ovem lastnem (netransformiranem) okviru
 
+
+def check_cad_frame(mesh: o3d.geometry.TriangleMesh,
+                    max_origin_distance_mm: float = 100.0) -> None:
+    """Izpiše, kje leži izhodišče CAD datoteke (0,0,0) glede na sam del, in
+    opozori na tipične napake pri izvozu iz SolidWorksa.
+
+    ZAKAJ: končna transformacija iz run_registration je poza CAD-ovega
+    LASTNEGA koordinatnega sistema glede na kamero - robot pa ima pot nanosa
+    tesnila sprogramirano v dogovorjenem KS (Coordinate System1 na
+    poenostavljenih modelih). Rezultat je uporaben za robota SAMO, če je bil
+    STL izvožen v tem istem KS (SolidWorks: Save As -> STL -> Options ->
+    "Output coordinate system" = Coordinate System1). Kje točno je to
+    izhodišče, za natančnost registracije NI pomembno (ista toga
+    transformacija, glej transform_with_pivot) - pomembno je le, da ga vsi
+    uporabljamo ENAKEGA. Ta funkcija tega ne more preveriti, lahko pa ujame
+    očitne napake: napačne enote (metri namesto mm) ali izhodišče daleč
+    stran od dela (izvoz v privzetem KS sestava namesto v Coordinate System1)."""
+    min_bound, max_bound = mesh.get_min_bound(), mesh.get_max_bound()
+    extent = max_bound - min_bound
+    origin_to_bbox = float(np.linalg.norm(np.maximum(0.0, np.maximum(min_bound, -max_bound))))   # 0, če je izhodišče znotraj očrtane škatle dela
+    print(f"  CAD frame: bbox min={np.round(min_bound, 2)}, max={np.round(max_bound, 2)}, "
+          f"extent={np.round(extent, 2)}; origin (0,0,0) is {origin_to_bbox:.1f} mm outside the part's bounding box")
+    if extent.max() < 1.0:
+        print("  WARNING: CAD extent < 1 unit - the STL was probably exported in METERS, "
+              "the pipeline expects millimeters (SolidWorks STL export options -> Unit: Millimeters)")
+    if origin_to_bbox > max_origin_distance_mm:
+        print(f"  WARNING: CAD origin is more than {max_origin_distance_mm:.0f} mm from the part - "
+              f"was the STL exported in the agreed coordinate system (Coordinate System1)?")
+
+
+def transform_with_pivot(rotation_matrix: np.ndarray, pivot_target_position: np.ndarray,
+                         pivot_point: np.ndarray) -> np.ndarray:
+    """Sestavi 4x4 rigidno transformacijo, ki telo zavrti za rotation_matrix
+    OKOLI pivot_point (v CAD-ovem lastnem, netransformiranem okviru - npr.
+    compute_native_reference_point-ova "sealing" regija), namesto okoli
+    CAD-ovega surovega izvora (0,0,0), nato ga premakne tako, da pivot_point
+    natanko pristane na pivot_target_position.
+
+    Za VSAKO točko X velja transform(X) = R @ (X - pivot_point) +
+    pivot_target_position - ne le za pivot_point samega - torej gre
+    dejansko za rotacijo okoli pivot_point, ne le za translacijski popravek
+    izračunan na enem samem primeru. Matematično enakovredno kateremukoli
+    izboru pivot_point (isti togi transformaciji, samo drugače
+    parametrizirani) - pivot_point NI potrebno, da je dejansko izmerjen/
+    zajet v (lahko delnem) oblaku točk, ker gre za konstanto, izračunano na
+    CELOTNI, vedno popolnoma znani CAD mreži."""
+    transform = np.eye(4)
+    transform[:3, :3] = rotation_matrix
+    transform[:3, 3] = pivot_target_position - rotation_matrix @ pivot_point
+    return transform
+
 # TO JE SINTETIČNA KAMERA, KI JO BOMO POTREBOVAL TUDI PRI REALNEM SKENIRANJU
 # NAMEN JE, DA SE NORMALE OBLAKA TOČK CAD MODELA OBRNEJO V ISTO SMER KOT BODO OD SKENIRANGA POINT CLOUDA
 # ČE TE FUNKCIJE NI SO NORMALE OBLAKA TOČK SOURCE MODELA OBRNJENE V NAPAČNO SMER ( NE MORE PRIMERJAT S TARGET MODELOM)
@@ -1098,7 +1149,7 @@ def robust_top_value(values: np.ndarray, percentile: float) -> float:
     ga komaj premakne."""
     return float(np.percentile(values, percentile))
 
-
+########
 def rotation_aligning_vectors(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """Rodriguesova rotacijska formula: rotacijska matrika, ki preslika
     enotski vektor a na enotski vektor b (rotacija z najmanjšim kotom, ki
@@ -1876,11 +1927,23 @@ def compute_scan_point_sigma_mm(scan_points: np.ndarray,
                                         noise_reference_distance_m)
 
 
-def transformation_error(estimated: np.ndarray, reference: np.ndarray) -> dict:
+def transformation_error(estimated: np.ndarray, reference: np.ndarray,
+                         reference_point: Optional[np.ndarray] = None) -> dict:
     """Razstavi odstopanje med ocenjeno in referenčno 4x4 rigidno
     transformacijo na napako rotacijskega kota (stopinje) in translacijsko
     napako (enake enote kot oblak točk), namesto surove razlike matrik, ki
-    oboje zmeša v težko razumljive številke."""
+    oboje zmeša v težko razumljive številke.
+
+    reference_point (privzeto None - CAD-ov surov izvor): translacijska
+    napaka se meri kot razdalja med tem, kam TA točka (v CAD-ovem lastnem,
+    netransformiranem okviru) pristane pod ocenjeno transformacijo, in kam
+    pristane pod referenčno - namesto surove razlike surovih translacijskih
+    vektorjev. Brez tega bi bila translation_error umetno napihnjena z
+    "vzvodom" (lever arm): CAD-ov surov izvor je lahko deset(ih) mm+ stran
+    od dejansko skeniranega dela (glej compute_native_reference_point), zato
+    že majhna napaka rotacijskega KOTA pri surovem izvoru ustvari veliko
+    navidezno translacijsko napako, čeprav je dejanski del na skoraj pravem
+    mestu - glej transform_with_pivot."""
     r_est, t_est = estimated[:3, :3], estimated[:3, 3]   # rotacijski in translacijski del ocenjene transformacije
     r_ref, t_ref = reference[:3, :3], reference[:3, 3]   # rotacijski in translacijski del referenčne transformacije
 
@@ -1888,7 +1951,12 @@ def transformation_error(estimated: np.ndarray, reference: np.ndarray) -> dict:
     # Kot rotacije iz sledi (trace) rotacijske matrike: trace(R) = 1 + 2*cos(theta).
     cos_theta = np.clip((np.trace(r_delta) - 1.0) / 2.0, -1.0, 1.0)   # kosinus napake kota, omejen na veljavno območje
     rotation_error_deg = np.degrees(np.arccos(cos_theta))   # napaka rotacije v stopinjah
-    translation_error = np.linalg.norm(t_est - t_ref)   # napaka translacije (evklidska razdalja)
+    if reference_point is None:
+        translation_error = np.linalg.norm(t_est - t_ref)   # napaka translacije (evklidska razdalja) pri CAD-ovem surovem izvoru
+    else:
+        p_est = r_est @ reference_point + t_est   # kam pristane referenčna (pivot) točka pod ocenjeno transformacijo
+        p_ref = r_ref @ reference_point + t_ref   # kam pristane referenčna (pivot) točka pod referenčno transformacijo
+        translation_error = np.linalg.norm(p_est - p_ref)   # napaka translacije PRI referenčni točki, ne pri surovem izvoru
 
     return {
         "rotation_error_deg": rotation_error_deg,   # napaka rotacije v stopinjah
@@ -2304,6 +2372,14 @@ def run_registration(cad_path: Path,
     # zdaj tudi Phase 4.5 (point_to_mesh_icp polish) NE GLEDE NA use_real_scan,
     # ne le simulate_camera_scan spodaj.
     cad_mesh = load_cad_mesh(cad_path)   # naložimo CAD kot NEobrezano, NEtransformirano mrežo (za ray casting IN/ali mesh-polish)
+    check_cad_frame(cad_mesh)   # izpiše/opozori, v katerem KS je CAD - glej check_cad_frame docstring
+    # Ista pivot/referenčna točka kot main()-ov SIMULATED_TRANSFORM (glej
+    # compute_native_reference_point in transform_with_pivot) - uporabljena
+    # spodaj SAMO za poročanje translation_error (glej transformation_error
+    # docstring), da napaka ni umetno napihnjena z "vzvodom" okoli CAD-ovega
+    # surovega izvora, ki je lahko deset(ih) mm+ stran od dela.
+    reference_point = compute_native_reference_point(
+        cad_mesh, top_fraction=top_fraction, up_axis=up_axis, flip_up_direction=flip_up_direction)
 
     print("Phase 2: Loading target scan...")
     # target_grid_points/target_hit_mask: organizirana (H,W) mreža, na voljo
@@ -2493,8 +2569,9 @@ def run_registration(cad_path: Path,
     print(f"  Yaw sweep fitness: {coarse_result.fitness:.4f}, "
           f"inlier_rmse: {coarse_result.inlier_rmse:.4f}")
     if not use_real_scan:   # pri simulaciji poznamo referenčno transformacijo, lahko preverimo napako
-        err = transformation_error(coarse_result.transformation, SIMULATED_TRANSFORM)
-        print(f"  Yaw sweep vs reference transform: "
+        err = transformation_error(coarse_result.transformation, SIMULATED_TRANSFORM, reference_point)
+        print(f"  Yaw sweep vs reference transform (translation error at the part's "
+              f"reference point, not the CAD's raw origin): "
               f"rotation_error={err['rotation_error_deg']:.2f} deg, "
               f"translation_error={err['translation_error']:.3f}, "
               f"frobenius_norm={err['frobenius_norm']:.3f}")
@@ -2611,14 +2688,19 @@ def run_registration(cad_path: Path,
                       f"keeping the pre-polish transformation")
 
     draw_registration_result(source, target, icp_result.transformation, "ICP Result")   # vizualiziramo končni rezultat
-    print("Final transformation matrix:")
+    print("Final transformation matrix (pose of the CAD file's own coordinate system in the camera frame - "
+          "this is what the robot needs, IF the STL was exported in the agreed Coordinate System1):")
     print(icp_result.transformation)
+    sealing_point_in_camera = icp_result.transformation[:3, :3] @ reference_point + icp_result.transformation[:3, 3]
+    print(f"  Sealing-region centroid (CAD {np.round(reference_point, 2)}) lands at "
+          f"{np.round(sealing_point_in_camera, 2)} in the camera frame")
 
     if not use_real_scan:
         print(f"Reference transformation matrix (used to generate the simulated scan):")
         print(SIMULATED_TRANSFORM)
-        err = transformation_error(icp_result.transformation, SIMULATED_TRANSFORM)
-        print(f"ICP vs reference transform: "
+        err = transformation_error(icp_result.transformation, SIMULATED_TRANSFORM, reference_point)
+        print(f"ICP vs reference transform (translation error at the part's "
+              f"reference point, not the CAD's raw origin): "
               f"rotation_error={err['rotation_error_deg']:.2f} deg, "
               f"translation_error={err['translation_error']:.3f}, "
               f"frobenius_norm={err['frobenius_norm']:.3f}")
@@ -3447,21 +3529,24 @@ def main() -> None:
     rotation_matrix = rotation_only[:3, :3]
     requested_translation = np.array([args.translation_x, args.translation_y, args.translation_z])
     if args.use_real_scan:
-        corrected_translation = requested_translation   # SIMULATED_TRANSFORM se pri pravem skenu ne uporablja - popravek ni potreben
+        # SIMULATED_TRANSFORM se pri pravem skenu ne uporablja - pivot popravek ni potreben
+        SIMULATED_TRANSFORM = build_reference_transform(
+            translation_x=requested_translation[0], translation_y=requested_translation[1],
+            translation_z=requested_translation[2], rotation_x_deg=args.rotation_x_deg,
+            rotation_y_deg=args.rotation_y_deg, rotation_z_deg=args.rotation_z_deg)
     else:
-        reference_mesh = load_cad_mesh(cad_path)   # NEtransformirana CAD mreža, samo za izračun referenčne točke
+        reference_mesh = load_cad_mesh(cad_path)   # NEtransformirana CAD mreža, samo za izračun referenčne (pivot) točke
         reference_point = compute_native_reference_point(
             reference_mesh, top_fraction=args.top_fraction, up_axis=args.up_axis,
             flip_up_direction=args.flip_up_direction)
-        corrected_translation = requested_translation - rotation_matrix @ reference_point
         print(f"Native CAD reference point (center of the scanned sealing region, "
               f"pre-rotation/translation): {reference_point} - --translation_x/y/z is "
-              f"relative to THIS point, not the CAD file's raw coordinate origin")
-
-    SIMULATED_TRANSFORM = build_reference_transform(
-        translation_x=corrected_translation[0], translation_y=corrected_translation[1],
-        translation_z=corrected_translation[2], rotation_x_deg=args.rotation_x_deg,
-        rotation_y_deg=args.rotation_y_deg, rotation_z_deg=args.rotation_z_deg)
+              f"relative to THIS point, not the CAD file's raw coordinate origin, and "
+              f"rotation is applied AROUND this point, not around the CAD file's raw origin")
+        # rotate around reference_point (namesto okoli CAD-ovega surovega
+        # izvora), nato reference_point postavimo natanko na
+        # requested_translation - glej transform_with_pivot docstring.
+        SIMULATED_TRANSFORM = transform_with_pivot(rotation_matrix, requested_translation, reference_point)
     print(f"Reference (ground-truth) transform - part pose relative to the camera "
           f"(fixed at the origin):\n{SIMULATED_TRANSFORM}\n")
 

@@ -13,3 +13,7 @@ __pycache__/
 *.pyc
 .vscode/
 .idea/
+# Generirano ob zagonu (predpomnilnik predobdelave) in SolidWorks zaklepne datoteke
+.preprocess_cache/
+~$*
+*.STL

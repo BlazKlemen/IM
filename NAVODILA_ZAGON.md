@@ -94,7 +94,7 @@ python kontrolna_plosca.py
   `python main_trial.py --iss_target_min_keypoints 1000 --iss_target_max_keypoints 4000`
   (v VS Code to naredi konfiguracija **"Main"** v `.vscode/launch.json`, `F5`).
 - `python camera_benchmark.py` / `python camera_translation_benchmark.py` – primerjava kamer, rezultat v `.xlsx` (Excel datoteka med zagonom **ne sme biti odprta**).
-- Potreben je STL `eHDS S Housing + CC s pottingom, fine.STL` (je v repozitoriju; izvožen mora biti v koordinatnem sistemu *Coordinate System1*, mm).
+- Potreben je STL `d_housing_detailed.STL` (izvor na pinu; izvožen mora biti v koordinatnem sistemu *Coordinate System1*, mm).
 - Prvi zagon je počasen (vzorčenje STL), naslednji uporabijo `.preprocess_cache`.
 
 ### 5.2 Kalibracija
